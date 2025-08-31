@@ -149,6 +149,10 @@ class GantrySim:
         self.smart_speed = 0.0            # |v1| at intercept
         self.smart_u = (0.0, 0.0)         # unit direction of v1
 
+        self.smart_trace_x = []
+        self.smart_trace_y = []
+        self.smart_trace_version = 0
+
         # Time-optimal schedule (computed in plan_smart)
         self.smart_sched_t = []   # knot times (s)
         self.smart_sched_x = []   # knot x
@@ -415,6 +419,9 @@ class GantrySim:
             self.smart_idx_int    = N           # split index for Hermite vs tail
             self.smart_version   += 1
             self.state.mode       = MODE_SMART
+            self.smart_trace_x = [self.state.x]
+            self.smart_trace_y = [self.state.y]
+            self.smart_trace_version += 1
 
     def _approach_1d(self, pos, vel, target, vmax, amax, dt):
         dx = target - pos
@@ -514,12 +521,18 @@ class GantrySim:
                     ry = ys[i] * (1.0 - a) + ys[j] * a
                     self.target[0] = clamp(rx, 0.0, X_MAX)
                     self.target[1] = clamp(ry, 0.0, Y_MAX)
+
+                    self.smart_trace_x.append(st.x)
+                    self.smart_trace_y.append(st.y)
+
                 else:
                     # Done: hand off to tracker at final stop point
                     self.smart_active = False
                     st.mode = MODE_TARGET
                     self.target[0] = self.smart_sched_x[-1] if self.smart_sched_x else st.x
                     self.target[1] = self.smart_sched_y[-1] if self.smart_sched_y else st.y
+
+
 
             if st.mode == MODE_IDLE:
                 if (time.time() - self.last_cmd_time) > IDLE_TIMEOUT_S:
@@ -723,7 +736,7 @@ class GantrySim:
 # Embeddable Sim Canvas (Qt)
 # ===============================
 
-def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
+def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy, get_show_trace):
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
@@ -819,6 +832,8 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
     
     smart_simple, = ax.plot([], [], '-',  linewidth=2.0, color='red', alpha=0.55, zorder=5)
     smart_tail_simple, = ax.plot([], [], linestyle=(0,(1,2)), lw=2.0, color='red', alpha=0.55, zorder=5)
+
+    actual_path_line, = ax.plot([], [], '-', color='black', alpha=0.28, linewidth=2.0, zorder=8)
 
     def refresh_dims():
         ax.set_xlim(-FRAME_MARGIN, X_MAX + FRAME_MARGIN)
@@ -1062,6 +1077,7 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
             clear_markers()
             intercept_dot.set_data([], [])
             cur_dot.set_data([], [])
+            actual_path_line.set_data([], [])
 
         # Decide what to show
         show_latched = latched["has"] and (cmd_time == latched["cmd_time"])
@@ -1195,7 +1211,13 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
                 else:
                     cur_dot.set_data([], [])
 
-                # --- Ensure a basic red SMART path is drawn in Performance mode ---
+            if get_show_trace():
+                with sim.lock:
+                    txs = list(sim.smart_trace_x)
+                    tys = list(sim.smart_trace_y)
+                actual_path_line.set_data(txs, tys)
+            else:
+                actual_path_line.set_data([], [])
         
         if sim.performance_mode and show_smart_viz:
             if len(xs) >= 2:
@@ -1241,6 +1263,8 @@ def run_control_panel(sim: GantrySim):
     cy_val       = {"v": Y_MAX/2.0}
     sqw_val      = {"v": min(300.0, X_MAX)}
     sqh_val      = {"v": min(300.0, Y_MAX)}
+
+    show_trace_val = {"v": True}
 
     w = QtWidgets.QWidget()
     w.setObjectName("controlPanel")
@@ -1418,6 +1442,17 @@ def run_control_panel(sim: GantrySim):
     lay_p.addWidget(chk_hist)
     root.addWidget(gb_perf)
 
+    gb_over = QtWidgets.QGroupBox("Overlays")
+    lay_over = QtWidgets.QHBoxLayout(gb_over)
+    chk_trace = QtWidgets.QCheckBox("Show actual cart path")
+    chk_trace.setChecked(True)
+    def on_toggle(v):
+        show_trace_val["v"] = bool(v)
+    chk_trace.stateChanged.connect(on_toggle)
+    lay_over.addStretch(1); lay_over.addWidget(chk_trace); lay_over.addStretch(1)
+    root.addWidget(gb_over)
+
+
     # --- Sequence logic (Qt timer) ---
     seq = {"active": False, "phase": 0, "t_dwell": 0.0, "tx": 0.0, "ty": 0.0}
 
@@ -1467,7 +1502,7 @@ def run_control_panel(sim: GantrySim):
     seq_timer.start(50)
 
     # Return widget + getters used by sim click handler
-    return (w, lambda: smart_vx_val["v"], lambda: smart_vy_val["v"])
+    return (w, lambda: smart_vx_val["v"], lambda: smart_vy_val["v"], lambda: show_trace_val["v"])
 
 # ===============================
 # Main Window (dockable panel)
@@ -1479,8 +1514,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Thesis Digital Twin")
 
         # Build control panel first to pass getters into the sim canvas
-        panel_widget, get_svx, get_svy = run_control_panel(sim)
-        fig, canvas = build_sim_canvas(sim, get_svx, get_svy)
+        panel_widget, get_svx, get_svy, get_show_trace = run_control_panel(sim)
+        fig, canvas = build_sim_canvas(sim, get_svx, get_svy, get_show_trace)
 
         # Central: sim canvas
         self.setCentralWidget(canvas)
