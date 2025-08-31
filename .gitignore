@@ -1,0 +1,33 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editors/IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+build/
+dist/
+
+# Notebooks & caches
+.ipynb_checkpoints/
+
+# CMake/builds (if any sim code builds)
+build*/ 
+cmake-build-*/
+
+# Arduino / PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+*.elf
+*.hex
+
+# Data cache
+data/tmp/
