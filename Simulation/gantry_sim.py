@@ -162,6 +162,9 @@ class GantrySim:
         self.hist = deque()  # (t, speed_mm_s)
         self.hist_last = 0.0
 
+        self.performance_mode = False 
+        self.live_hist_enabled = True
+
         self.belt_ofs = {
             'top_l':0.0, 'top_r':0.0, 'bot':0.0,
             'left_outer':0.0, 'right_outer':0.0,
@@ -634,15 +637,20 @@ class GantrySim:
             st.thetaB = (st.thetaB + wB * DT) % (2.0 * math.pi)
 
         now = time.time()
-        if now - self.hist_last >= 0.01:
-            self.hist_last = now
-            v_now = math.hypot(self.state.vx, self.state.vy)
-            self.hist.append((now, v_now))
-            # trim old samples
-            cutoff = now - self.hist_window_s
-            while self.hist and self.hist[0][0] < cutoff:
-                self.hist.popleft()
-        if now - self.last_status_time >= 1.0/STATUS_HZ:
+        if self.live_hist_enabled:
+            if now - self.hist_last >= 0.01:
+                self.hist_last = now
+                v_now = math.hypot(self.state.vx, self.state.vy)
+                self.hist.append((now, v_now))
+                cutoff = now - self.hist_window_s
+                while self.hist and self.hist[0][0] < cutoff:
+                    self.hist.popleft()
+        else:
+            # If disabled, keep it empty so plotting work is zero
+            if self.hist:
+                self.hist.clear()
+
+        if not self.performance_mode and now - self.last_status_time >= 1.0/STATUS_HZ:
             self.last_status_time = now
             print(self.build_status(), flush=True)
 
@@ -808,6 +816,9 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
                   fontsize=10, fontweight="bold", color='black')
     spd_txt = ax.text(0.5, 0.02, "", transform=ax.transAxes, va='bottom', ha='center',
                       fontsize=10, fontweight='bold', color='black')
+    
+    smart_simple, = ax.plot([], [], '-',  linewidth=2.0, color='red', alpha=0.55, zorder=5)
+    smart_tail_simple, = ax.plot([], [], linestyle=(0,(1,2)), lw=2.0, color='red', alpha=0.55, zorder=5)
 
     def refresh_dims():
         ax.set_xlim(-FRAME_MARGIN, X_MAX + FRAME_MARGIN)
@@ -836,6 +847,26 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
         "split_idx": 0, "T_int": 0.0, "T_total": 0.0, "v_int": 0.0,
         "p1": (0.0, 0.0)
     }
+
+    def apply_perf_flags():
+        # Show/hide speed axis
+        ax_speed.set_visible(not sim.performance_mode)
+
+        # In perf mode hide the heavy collections; in test mode hide the simple lines
+        show_pretty = not sim.performance_mode
+        lc_hermite.set_visible(show_pretty)
+        lc_tail.set_visible(show_pretty)
+
+        smart_simple.set_visible(not show_pretty)
+        smart_tail_simple.set_visible(not show_pretty)
+
+        # Throttle animation a bit in performance mode to save CPU
+        try:
+            interval = 34 if sim.performance_mode else int(1000/60.0)  # ~30 FPS vs 60 FPS
+            fig._ani.event_source.setInterval(interval)
+        except Exception:
+            pass
+
 
     def update_geometry(x, y):
         x_left  = -CARR_W/2.0
@@ -913,6 +944,14 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
                 speed_markers[k] = None
 
     def rebuild_speed_panel(ts, vs, split_idx, T_int, T_total, v_int):
+        if sim.performance_mode:
+            # Hide all markers & segments in perf mode
+            clear_markers()
+            lc_speed.set_segments([]); lc_speed_tail.set_segments([])
+            cur_dot.set_data([], [])           # <- hide any leftovers
+            cur_dot.set_visible(False)
+            return
+        
         clear_markers()
         if len(ts) < 2: 
             lc_speed.set_segments([]); lc_speed.set_array(np.array([]))
@@ -964,6 +1003,8 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
 
     def update_plot(_frame):
         nonlocal last_version
+        apply_perf_flags()
+
         if (last_dims["x"] != X_MAX) or (last_dims["y"] != Y_MAX) or (last_dims["r"] != GEAR_RADIUS_MM):
             refresh_dims()
             last_dims["x"], last_dims["y"], last_dims["r"] = X_MAX, Y_MAX, GEAR_RADIUS_MM
@@ -1027,30 +1068,27 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
         show_smart_viz = smart_active or show_latched
 
         if not show_smart_viz:
-            # Normal preview (only when no smart viz is latched/active)
+            # Preview path as before
             xs_prev, ys_prev, eta = sim.predict_to_target(max_secs=20.0, dt_step=DT*2.0)
             path_line.set_data(xs_prev, ys_prev)
 
-            # Normal preview (only when no smart viz is latched/active)
-            xs_prev, ys_prev, eta = sim.predict_to_target(max_secs=20.0, dt_step=DT*2.0)
-            path_line.set_data(xs_prev, ys_prev)
-
-            # Live 2s speed history
-            with sim.lock:
-                hist = list(sim.hist)
-            if hist:
-                t_now = hist[-1][0]
-                xs = [2.0 - (t_now - t) for (t, _) in hist]  # 0..2s, scrolling left->right
-                ys = [v for (_, v) in hist]
-                hist_line.set_data(xs, ys)
-                ax_speed.set_xlim(0.0, 2.0)
-                y_max = max(1.0, max(ys))
-                ax_speed.set_ylim(0.0, y_max * 1.10)
+            # Live 2s speed history (only if enabled and not in perf mode)
+            if (not sim.performance_mode) and sim.live_hist_enabled:
+                with sim.lock:
+                    hist = list(sim.hist)
+                if hist:
+                    t_now = hist[-1][0]
+                    xs_h = [2.0 - (t_now - t) for (t, _) in hist]
+                    ys_h = [v for (_, v) in hist]
+                    hist_line.set_data(xs_h, ys_h)
+                    ax_speed.set_xlim(0.0, 2.0)
+                    y_max = max(1.0, max(ys_h))
+                    ax_speed.set_ylim(0.0, y_max * 1.10)
+                else:
+                    hist_line.set_data([], [])
             else:
                 hist_line.set_data([], [])
-
         else:
-            # We’re showing a smart path (active or latched); hide preview
             path_line.set_data([], [])
             hist_line.set_data([], [])
 
@@ -1063,14 +1101,30 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
                     segs = np.stack([pts[:-1], pts[1:]], axis=1)
                     cvals = 0.5 * (np.array(vs[:-1]) + np.array(vs[1:]))
                     split = int(min(max(0, split_idx), len(segs)))
-                    vmax_c = max(1.0, np.max(cvals))
-                    lc_hermite.set_segments(segs[:split]); lc_hermite.set_array(cvals[:split]); lc_hermite.set_clim(0.0, vmax_c)
-                    lc_tail.set_segments(segs[split:]);    lc_tail.set_array(cvals[split:]);    lc_tail.set_clim(0.0, vmax_c)
-                    ensure_dotted(lc_tail)
+
+                    if not sim.performance_mode:
+                        vmax_c = max(1.0, np.max(cvals))
+                        lc_hermite.set_segments(segs[:split]); lc_hermite.set_array(cvals[:split]); lc_hermite.set_clim(0.0, vmax_c)
+                        lc_tail.set_segments(segs[split:]);    lc_tail.set_array(cvals[split:]);    lc_tail.set_clim(0.0, vmax_c)
+                        ensure_dotted(lc_tail)
+
+                        # Clear simple lines
+                        smart_simple.set_data([], [])
+                        smart_tail_simple.set_data([], [])
+                    else:
+                        # Feed simple lines only
+                        smart_simple.set_data(np.array(xs[:split+1]), np.array(ys[:split+1]))
+                        smart_tail_simple.set_data(np.array(xs[split:]), np.array(ys[split:]))
+
+                        # Clear heavy collections
+                        lc_hermite.set_segments([]); lc_hermite.set_array(np.array([]))
+                        lc_tail.set_segments([]);    lc_tail.set_array(np.array([]))
                 else:
+                    # Clear everything
                     lc_hermite.set_segments([]); lc_hermite.set_array(np.array([]))
                     lc_tail.set_segments([]);    lc_tail.set_array(np.array([]))
-                    ensure_dotted(lc_tail)
+                    smart_simple.set_data([], [])
+                    smart_tail_simple.set_data([], [])
 
                 # speed panel
                 v_int = sim.smart_speed
@@ -1095,12 +1149,26 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
                     segs = np.stack([pts[:-1], pts[1:]], axis=1)
                     cvals = 0.5 * (np.array(vs[:-1]) + np.array(vs[1:]))
                     split = int(min(max(0, split_idx), len(segs)))
-                    vmax_c = max(1.0, np.max(cvals))
-                    lc_hermite.set_segments(segs[:split]); lc_hermite.set_array(cvals[:split]); lc_hermite.set_clim(0.0, vmax_c)
-                    lc_tail.set_segments(segs[split:]);    lc_tail.set_array(cvals[split:]);    lc_tail.set_clim(0.0, vmax_c)
-                    ensure_dotted(lc_tail)
-                    # rebuild speed panel from snapshot
-                    rebuild_speed_panel(ts, vs, split_idx, T_int, T_total, v_int)
+
+                    if not sim.performance_mode:
+                        vmax_c = max(1.0, np.max(cvals))
+                        lc_hermite.set_segments(segs[:split]); lc_hermite.set_array(cvals[:split]); lc_hermite.set_clim(0.0, vmax_c)
+                        lc_tail.set_segments(segs[split:]);    lc_tail.set_array(cvals[split:]);    lc_tail.set_clim(0.0, vmax_c)
+                        ensure_dotted(lc_tail)
+                        # rebuild speed panel from snapshot
+                        rebuild_speed_panel(ts, vs, split_idx, T_int, T_total, v_int)
+
+                        # Clear simple lines
+                        smart_simple.set_data([], [])
+                        smart_tail_simple.set_data([], [])
+                    else:
+                        # Feed simple lines only
+                        smart_simple.set_data(np.array(xs[:split+1]), np.array(ys[:split+1]))
+                        smart_tail_simple.set_data(np.array(xs[split:]), np.array(ys[split:]))
+
+                        # Clear heavy collections
+                        lc_hermite.set_segments([]); lc_hermite.set_array(np.array([]))
+                        lc_tail.set_segments([]);    lc_tail.set_array(np.array([]))
 
             # Intercept dot & ETA text
             intercept_dot.set_data([p1[0]], [p1[1]])
@@ -1127,6 +1195,21 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
                 else:
                     cur_dot.set_data([], [])
 
+                # --- Ensure a basic red SMART path is drawn in Performance mode ---
+        
+        if sim.performance_mode and show_smart_viz:
+            if len(xs) >= 2:
+                # Use the same split logic (Hermite vs tail)
+                split = int(min(max(0, split_idx), len(xs)-1))
+                smart_simple.set_data(np.asarray(xs[:split+1]), np.asarray(ys[:split+1]))
+                smart_tail_simple.set_data(np.asarray(xs[split:]), np.asarray(ys[split:]))
+            else:
+                smart_simple.set_data([], [])
+                smart_tail_simple.set_data([], [])
+
+            # And make sure the heavy collections don't accidentally show
+            lc_hermite.set_segments([]); lc_tail.set_segments([])
+
         spd_txt.set_text(f"Mode: {mode}")
         hud.set_text(f"Target: ({tx:.1f}, {ty:.1f})  |  Pos: ({x:.1f}, {y:.1f})")
         return ()
@@ -1134,6 +1217,7 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
     ani = FuncAnimation(fig, update_plot, interval=1000/60.0)
     fig._ani = ani
     canvas._ani = ani
+    apply_perf_flags()
     return fig, canvas
 
 # ===============================
@@ -1304,6 +1388,35 @@ def run_control_panel(sim: GantrySim):
 
     root.addWidget(gb_tests)
     root.addStretch(1)
+
+    # --- Performance ---
+    gb_perf = QtWidgets.QGroupBox("Performance")
+    lay_p = QtWidgets.QVBoxLayout(gb_perf)
+
+    chk_perf = QtWidgets.QCheckBox("Performance mode (lean UI)")
+    chk_perf.setChecked(False)
+
+    chk_hist = QtWidgets.QCheckBox("Live speed history (non-SMART)")
+    chk_hist.setToolTip("Disable to remove the scrolling 2s plot.")
+    chk_hist.setChecked(True)
+
+    def on_perf_toggled(checked):
+        with sim.lock:
+            sim.performance_mode = bool(checked)
+        # Ask canvas to update visibility/FPS
+        # We can't reach apply_perf_flags() from here directly, so emit a tiny timer to let the canvas frame pick it up
+        QtCore.QTimer.singleShot(0, lambda: None)
+
+    def on_hist_toggled(checked):
+        with sim.lock:
+            sim.live_hist_enabled = bool(checked)
+
+    chk_perf.toggled.connect(on_perf_toggled)
+    chk_hist.toggled.connect(on_hist_toggled)
+
+    lay_p.addWidget(chk_perf)
+    lay_p.addWidget(chk_hist)
+    root.addWidget(gb_perf)
 
     # --- Sequence logic (Qt timer) ---
     seq = {"active": False, "phase": 0, "t_dwell": 0.0, "tx": 0.0, "ty": 0.0}
