@@ -22,6 +22,7 @@ from matplotlib.lines import Line2D
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.collections import LineCollection
 from matplotlib import colors as mcolors
+from collections import deque
 
 # Qt
 from PyQt5 import QtWidgets, QtCore
@@ -51,7 +52,7 @@ IDLER_RADIUS_MM = 10.0
 
 MAX_V_NORMAL = 300.0
 MAX_A_NORMAL = 1500.0
-MAX_A_FAST   = 3000.0
+MAX_A_FAST   = 4000.0
 DECEL_A_SLOW = 250.0
 
 IDLE_TIMEOUT_S = 1.0
@@ -157,6 +158,9 @@ class GantrySim:
         self.smart_version = 0    # bump to tell UI to rebuild colored path/speed panel
         self.smart_idx_int = 0   # index where Hermite ends and decel tail begins
 
+        self.hist_window_s = 2.0
+        self.hist = deque()  # (t, speed_mm_s)
+        self.hist_last = 0.0
 
         self.belt_ofs = {
             'top_l':0.0, 'top_r':0.0, 'bot':0.0,
@@ -630,6 +634,14 @@ class GantrySim:
             st.thetaB = (st.thetaB + wB * DT) % (2.0 * math.pi)
 
         now = time.time()
+        if now - self.hist_last >= 0.01:
+            self.hist_last = now
+            v_now = math.hypot(self.state.vx, self.state.vy)
+            self.hist.append((now, v_now))
+            # trim old samples
+            cutoff = now - self.hist_window_s
+            while self.hist and self.hist[0][0] < cutoff:
+                self.hist.popleft()
         if now - self.last_status_time >= 1.0/STATUS_HZ:
             self.last_status_time = now
             print(self.build_status(), flush=True)
@@ -786,6 +798,8 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
     lc_tail.set_linestyle((0, (1, 8)))  # dotted
     ax.add_collection(lc_hermite)
     ax.add_collection(lc_tail)
+
+    hist_line, = ax_speed.plot([], [], lw=1.5, color='black', zorder=4)
 
     # Intercept marker (red→green after T_int)
     (intercept_dot,) = ax.plot([], [], marker='x', markersize=8, color='red', zorder=11)
@@ -1017,9 +1031,28 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy):
             xs_prev, ys_prev, eta = sim.predict_to_target(max_secs=20.0, dt_step=DT*2.0)
             path_line.set_data(xs_prev, ys_prev)
 
+            # Normal preview (only when no smart viz is latched/active)
+            xs_prev, ys_prev, eta = sim.predict_to_target(max_secs=20.0, dt_step=DT*2.0)
+            path_line.set_data(xs_prev, ys_prev)
+
+            # Live 2s speed history
+            with sim.lock:
+                hist = list(sim.hist)
+            if hist:
+                t_now = hist[-1][0]
+                xs = [2.0 - (t_now - t) for (t, _) in hist]  # 0..2s, scrolling left->right
+                ys = [v for (_, v) in hist]
+                hist_line.set_data(xs, ys)
+                ax_speed.set_xlim(0.0, 2.0)
+                y_max = max(1.0, max(ys))
+                ax_speed.set_ylim(0.0, y_max * 1.10)
+            else:
+                hist_line.set_data([], [])
+
         else:
             # We’re showing a smart path (active or latched); hide preview
             path_line.set_data([], [])
+            hist_line.set_data([], [])
 
             # If active and this is a new plan, (re)build and also latch it
             if smart_active and version != last_version:
@@ -1111,8 +1144,15 @@ def run_control_panel(sim: GantrySim):
     # Shared values for sim click handler
     smart_vx_val = {"v": 0.0}
     smart_vy_val = {"v": 200.0}
-    tgt_x_val    = {"v": X_MAX/2.0}
-    tgt_y_val    = {"v": Y_MAX/2.0}
+
+    # Normal target (T)
+    tgt_x_val    = {"v": 100.0}
+    tgt_y_val    = {"v": 700.0}
+
+    # Smart target (U) — separate from normal target
+    smart_tgt_x_val = {"v": 700.0}
+    smart_tgt_y_val = {"v": 100.0}
+
     cx_val       = {"v": X_MAX/2.0}
     cy_val       = {"v": Y_MAX/2.0}
     sqw_val      = {"v": min(300.0, X_MAX)}
@@ -1176,17 +1216,24 @@ def run_control_panel(sim: GantrySim):
 
     root.addWidget(gb_geo)
 
-    # --- Target & Smart ---
-    gb_target = QtWidgets.QGroupBox("Target & Smart")
+    # --- Targets & Smart ---
+    gb_target = QtWidgets.QGroupBox("Targets & Smart")
     lay_t = QtWidgets.QVBoxLayout(gb_target)
 
+    # Normal Target (T)
     spin_tx = mk_spin(tgt_x_val, 5.0, 0.0, 10000.0, lambda _: None, decimals=1)
     spin_ty = mk_spin(tgt_y_val, 5.0, 0.0, 10000.0, lambda _: None, decimals=1)
     lay_t.addLayout(pair_row("Target X", spin_tx, "Target Y", spin_ty))
 
+    # Smart Target (U) — independent inputs
+    spin_stx = mk_spin(smart_tgt_x_val, 5.0, 0.0, 10000.0, lambda _: None, decimals=1)
+    spin_sty = mk_spin(smart_tgt_y_val, 5.0, 0.0, 10000.0, lambda _: None, decimals=1)
+    lay_t.addLayout(pair_row("Smart Target X", spin_stx, "Smart Target Y", spin_sty))
+
+    # Intercept velocity for Smart (U)
     spin_svx = mk_spin(smart_vx_val, 10.0, -5000.0, 5000.0, lambda _: None, decimals=1)
     spin_svy = mk_spin(smart_vy_val, 10.0, -5000.0, 5000.0, lambda _: None, decimals=1)
-    lay_t.addLayout(pair_row("Smart vx", spin_svx, "Smart vy", spin_svy))
+    lay_t.addLayout(pair_row("Intercept vx", spin_svx, "Intercept vy", spin_svy))
 
     root.addWidget(gb_target)
 
@@ -1204,7 +1251,7 @@ def run_control_panel(sim: GantrySim):
 
     root.addWidget(gb_shapes)
 
-    # --- Buttons ---
+    # --- Commands ---
     gb_btns = QtWidgets.QGroupBox("Commands")
     grid = QtWidgets.QGridLayout(gb_btns)
 
@@ -1219,22 +1266,92 @@ def run_control_panel(sim: GantrySim):
     def do_target():
         x = tgt_x_val["v"]; y = tgt_y_val["v"]
         sim.handle_command(f"{MODE_TARGET},{x},{y}")
+
     def do_smart():
-        x = tgt_x_val["v"]; y = tgt_y_val["v"]
-        vx = smart_vx_val["v"]; vy = smart_vy_val["v"]
+        x = smart_tgt_x_val["v"]; y = smart_tgt_y_val["v"]
+        vx = smart_vx_val["v"];   vy = smart_vy_val["v"]
         sim.handle_command(f"{MODE_SMART},{x},{y},{vx},{vy}")
+
     def do_circle():
         sim.handle_command(f"{MODE_CIRCLE},{cx_val['v']},{cy_val['v']}")
+
     def do_square():
         sim.handle_command(f"{MODE_SQUARE},{sqw_val['v']},{sqh_val['v']}")
 
-    add_btn(2, 0, "Target (T)", do_target)
-    add_btn(2, 1, "Smart (U)",  do_smart)
+    add_btn(2, 0, "Send Target (T)", do_target)
+    add_btn(2, 1, "Send Smart (U)",  do_smart)
     add_btn(3, 0, "Circle (C)", do_circle)
     add_btn(3, 1, "Square (S)", do_square)
 
     root.addWidget(gb_btns)
+
+    # --- Quick Test: Target → Smart sequence ---
+    gb_tests = QtWidgets.QGroupBox("Quick Test")
+    lay_q = QtWidgets.QVBoxLayout(gb_tests)
+
+    row_opts = QtWidgets.QHBoxLayout()
+    wait_chk = QtWidgets.QCheckBox("Wait for settle"); wait_chk.setChecked(True)
+    dwell_lbl = QtWidgets.QLabel("Dwell:")
+    dwell_spin = QtWidgets.QDoubleSpinBox(); dwell_spin.setRange(0.0, 5.0)
+    dwell_spin.setSingleStep(0.1); dwell_spin.setDecimals(1); dwell_spin.setSuffix(" s"); dwell_spin.setValue(0.1)
+    row_opts.addWidget(wait_chk); row_opts.addStretch(1); row_opts.addWidget(dwell_lbl); row_opts.addWidget(dwell_spin)
+    lay_q.addLayout(row_opts)
+
+    btn_seq = QtWidgets.QPushButton("Run Target → Smart")
+    btn_cancel = QtWidgets.QPushButton("Cancel Pending Sequence")
+    row_btns = QtWidgets.QHBoxLayout(); row_btns.addWidget(btn_seq); row_btns.addWidget(btn_cancel)
+    lay_q.addLayout(row_btns)
+
+    root.addWidget(gb_tests)
     root.addStretch(1)
+
+    # --- Sequence logic (Qt timer) ---
+    seq = {"active": False, "phase": 0, "t_dwell": 0.0, "tx": 0.0, "ty": 0.0}
+
+    def is_settled(tx, ty):
+        with sim.lock:
+            st = sim.state
+            return (abs(st.x - tx) <= SNAP_POS and abs(st.y - ty) <= SNAP_POS
+                    and abs(st.vx) <= SNAP_VEL and abs(st.vy) <= SNAP_VEL)
+
+    def start_seq():
+        if seq["active"]: return
+        # Step 1: send normal target
+        tx = tgt_x_val["v"]; ty = tgt_y_val["v"]
+        sim.handle_command(f"{MODE_TARGET},{tx},{ty}")
+        seq.update({"active": True, "phase": 1, "t_dwell": 0.0, "tx": tx, "ty": ty})
+
+    def cancel_seq():
+        seq.update({"active": False, "phase": 0})
+
+    btn_seq.clicked.connect(start_seq)
+    btn_cancel.clicked.connect(cancel_seq)
+
+    def tick_seq():
+        if not seq["active"]:
+            return
+        if seq["phase"] == 1:
+            # Wait until settled (or skip if unchecked)
+            if (not wait_chk.isChecked()) or is_settled(seq["tx"], seq["ty"]):
+                if wait_chk.isChecked() and dwell_spin.value() > 0.0:
+                    seq["phase"] = 2
+                    seq["t_dwell"] = time.time()
+                else:
+                    seq["phase"] = 3
+        elif seq["phase"] == 2:
+            if time.time() - seq["t_dwell"] >= float(dwell_spin.value()):
+                seq["phase"] = 3
+        if seq["phase"] == 3:
+            # Step 2: send smart intercept to its own target
+            x = smart_tgt_x_val["v"]; y = smart_tgt_y_val["v"]
+            vx = smart_vx_val["v"];   vy = smart_vy_val["v"]
+            sim.handle_command(f"{MODE_SMART},{x},{y},{vx},{vy}")
+            seq["active"] = False
+            seq["phase"] = 0
+
+    seq_timer = QtCore.QTimer(w)
+    seq_timer.timeout.connect(tick_seq)
+    seq_timer.start(50)
 
     # Return widget + getters used by sim click handler
     return (w, lambda: smart_vx_val["v"], lambda: smart_vy_val["v"])
