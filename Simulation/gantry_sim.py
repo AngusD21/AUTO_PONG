@@ -27,6 +27,10 @@ from collections import deque
 # Qt
 from PyQt5 import QtWidgets, QtCore
 
+from Communications.ipc import ControlPublisher, InterceptSubscriber
+from Communications.gantry_comm import Gantry      # already in your tree
+from Path_Planning_2D.smart_path_planner import plan_smart, Limits
+
 # ===============================
 # Configuration
 # ===============================
@@ -169,6 +173,13 @@ class GantrySim:
         self.performance_mode = False 
         self.live_hist_enabled = True
 
+        self.ctrl_pub = ControlPublisher()
+        self.itc_sub  = InterceptSubscriber()
+        self.authority = "SIM"   # default master
+        self.last_ctrl_pub = 0.0
+
+        self.send_arduino = False
+
         self.belt_ofs = {
             'top_l':0.0, 'top_r':0.0, 'bot':0.0,
             'left_outer':0.0, 'right_outer':0.0,
@@ -193,6 +204,13 @@ class GantrySim:
         reply = "ACK"
 
         try:
+            if self.authority == "LIVE" and cmd in (MODE_TARGET, MODE_SMART, MODE_CIRCLE, MODE_SQUARE, MODE_MOUSE, MODE_REHOME):
+                reply = "ERR,read_only_in_live"
+                if sock:
+                    try: sock.sendall((reply + "\n").encode("utf-8"))
+                    except Exception: pass
+                return
+            
             if cmd in (MODE_IDLE, MODE_TARGET, MODE_SMART, MODE_CIRCLE, MODE_SQUARE, MODE_MOUSE):
                 if cmd == MODE_SMART:
                     x = float(parts[1]); y = float(parts[2])
@@ -281,142 +299,69 @@ class GantrySim:
     # Physics / Motion
     # ---------------------------------
 
-    def _hermite_coeffs(self, p0, v0, p1, v1, T):
-        T = max(T, 1e-6)
-        def axis_coeff(p0, v0, p1, v1):
-            def f(t):
-                tau = clamp(t / T, 0.0, 1.0)
-                h00 =  2*tau**3 - 3*tau**2 + 1
-                h10 =      tau**3 - 2*tau**2 + tau
-                h01 = -2*tau**3 + 3*tau**2
-                h11 =      tau**3 -    tau**2
-                return h00*p0 + h10*(T*v0) + h01*p1 + h11*(T*v1)
-            return f
-        fx = axis_coeff(p0[0], v0[0], p1[0], v1[0])
-        fy = axis_coeff(p0[1], v0[1], p1[1], v1[1])
-        return lambda t: (fx(t), fy(t))
+    def plan_smart(self, x, y, vx, vy, t_hit_s: float | None = None):
+        """
+        Thin wrapper: call Path_Planning_2D.smart_path_planner.plan_smart()
+        and adapt results into the sim’s visual structures.
 
-    def _choose_T(self, p0, v0, p1, v1):
-        dx = p1[0]-p0[0]; dy = p1[1]-p0[1]
-        dist = math.hypot(dx, dy)
-        vmax_axis = MAX_V_NORMAL
-        amax_axis = MAX_A_NORMAL
-        v_motor   = motor_vmax_mm_s()
-        v_allow   = max(50.0, min(vmax_axis, 0.9*v_motor))
-        t_pos     = dist / max(1.0, 0.6*v_allow)
-        dvx = abs(v1[0]-v0[0]); dvy = abs(v1[1]-v0[1])
-        t_vel = max(dvx, dvy) / max(1.0, 0.8*amax_axis)
-        T = max(0.25, t_pos, t_vel)
-        return min(T, 30.0)
-
-    def plan_smart(self, x, y, vx, vy):
+        x,y,vx,vy in mm / mm/s. If t_hit_s is provided (LIVE mode), we time-align.
+        """
+        # Snapshot current start state
         with self.lock:
-            p0 = (self.state.x, self.state.y)
-            v0 = (self.state.vx, self.state.vy)
-        p1 = (clamp(x, 0.0, X_MAX), clamp(y, 0.0, Y_MAX))
-        v1 = (vx, vy)
+            p0 = (float(self.state.x), float(self.state.y))
+            v0 = (float(self.state.vx), float(self.state.vy))
+        p1 = (clamp(float(x), 0.0, X_MAX), clamp(float(y), 0.0, Y_MAX))
+        v1 = (float(vx), float(vy))
 
-        T_guess = self._choose_T(p0, v0, p1, v1)
-        f = self._hermite_coeffs(p0, v0, p1, v1, T_guess)
+        # Call the shared planner (identical to tracker)
+        # Returns: schedule = [(t, x, y), ...], T_total
+        schedule, T_total = plan_smart(p0, v0, p1, v1, Limits(), dt_stream=0.02)
 
-        # --- sample Hermite path ---
-        N = 320
-        xs = []; ys = []
-        for i in range(N+1):
-            t = T_guess * (i / N)
-            px, py = f(t)
-            xs.append(clamp(px, 0.0, X_MAX))
-            ys.append(clamp(py, 0.0, Y_MAX))
+        if not schedule:
+            return
 
-        # --- time-optimal reparam along the Hermite (motor-limited) ---
-        dx = np.diff(xs); dy = np.diff(ys)
-        ds = np.hypot(dx, dy); ds[ds < 1e-9] = 1e-9
-        tx = dx / ds; ty = dy / ds
+        # Convert to arrays the sim expects
+        ts = [float(t) for (t, _, _) in schedule]
+        xs = [float(xx) for (_, xx, _) in schedule]
+        ys = [float(yy) for (_, _, yy) in schedule]
 
-        v_motor = motor_vmax_mm_s()
-        sdot_lim_motor = v_motor / np.maximum(np.maximum(np.abs(tx - ty), np.abs(tx + ty)), 1e-9)
-        sdot_max = sdot_lim_motor
+        # Approximate tangential speed along schedule (for coloring only)
+        vs = [0.0]
+        for i in range(1, len(ts)):
+            dt = max(1e-9, ts[i] - ts[i-1])
+            dx = xs[i] - xs[i-1]
+            dy = ys[i] - ys[i-1]
+            vs.append(math.hypot(dx, dy) / dt)
 
-        sdot0 = min(max(0.0, math.hypot(v0[0], v0[1])), sdot_max[0])
-        sdot1 = min(max(0.0, math.hypot(v1[0], v1[1])), sdot_max[-1])
+        # No separate "tail" here (Hermite already time-parameterised); UI supports empty tail.
+        split_idx = max(0, len(xs) - 1)  # treat entire schedule as the main segment
 
-        A = max(50.0, float(MAX_A_FAST))
-        v_nodes = np.zeros(N+1)
-        v_max_nodes = np.zeros(N+1)
-        v_max_nodes[0] = sdot_max[0]
-        v_max_nodes[-1] = sdot_max[-1]
-        if N > 1:
-            v_max_nodes[1:-1] = np.minimum(sdot_max[:-1], sdot_max[1:])
-
-        v_nodes[0] = min(sdot0, v_max_nodes[0])
-        for i in range(N):
-            v_allow = math.sqrt(v_nodes[i] * v_nodes[i] + 2.0 * A * ds[i])
-            v_nodes[i+1] = min(v_allow, v_max_nodes[i+1])
-        v_nodes[-1] = min(v_nodes[-1], sdot1)
-        for i in range(N-1, -1, -1):
-            if i == N: continue
-            v_allow = math.sqrt(v_nodes[i+1] * v_nodes[i+1] + 2.0 * A * ds[i])
-            v_nodes[i] = min(v_nodes[i], v_allow, v_max_nodes[i])
-        v_nodes[0]  = min(v_nodes[0],  sdot0)
-        v_nodes[-1] = min(v_nodes[-1], sdot1)
-
-        dt_seg = 2.0 * ds / np.maximum(v_nodes[:-1] + v_nodes[1:], 1e-9)
-        t_nodes = np.zeros(N+1); t_nodes[1:] = np.cumsum(dt_seg)
-        T_int = float(t_nodes[-1])
-
-        # --- decel tail (straight, dotted in UI; colored by speed) ---
-        speed1 = sdot1
-        tail_x = []; tail_y = []; tail_v = []; tail_t = []
-        if speed1 > 1e-6:
-            ux, uy = v1[0] / speed1, v1[1] / speed1
-            T_tail = speed1 / max(1e-6, DECEL_A_SLOW)
-            M = 120
-            dt = T_tail / M
-            xk, yk = xs[-1], ys[-1]
-            vk = speed1
-            tk = T_int
-            for _ in range(M):
-                vk1 = max(0.0, vk - DECEL_A_SLOW * dt)
-                ds_k = 0.5 * (vk + vk1) * dt
-                xk += ux * ds_k; yk += uy * ds_k; tk += dt
-                tail_x.append(clamp(xk, 0.0, X_MAX))
-                tail_y.append(clamp(yk, 0.0, Y_MAX))
-                tail_v.append(vk1)
-                tail_t.append(tk)
-                vk = vk1
-            T_total = tk
+        # LIVE time alignment: start so we arrive at t = t_hit_s (if provided)
+        # ekf planner returns T_total time to finish; if we want to ARRIVE after t_hit_s seconds, we should start after 'lead'
+        now = time.time()
+        if t_hit_s is not None:
+            lead = max(0.0, float(t_hit_s) - float(T_total))
+            t0 = now + lead                      # schedule starts in the future (t < 0 until then)
         else:
-            T_tail = 0.0
-            T_total = T_int
-
-        xs_hermite = xs[:]                    # N+1 pts
-        ys_hermite = ys[:]
-        xs_tail = tail_x[:]                   # M pts (or 0)
-        ys_tail = tail_y[:]
-
-        # stitch schedule (positions + speeds + times)
-        sched_x = xs_hermite + xs_tail
-        sched_y = ys_hermite + ys_tail
-        sched_v = list(v_nodes) + tail_v
-        sched_t = list(t_nodes) + tail_t
+            t0 = now                             # start immediately
 
         with self.lock:
-            self.smart_sched_t = sched_t
-            self.smart_sched_x = sched_x
-            self.smart_sched_y = sched_y
-            self.smart_sched_v = sched_v
-            self.smart_T       = T_int
-            self.smart_T_tail  = T_tail
-            self.smart_T_total = T_total
+            self.smart_sched_t = ts
+            self.smart_sched_x = xs
+            self.smart_sched_y = ys
+            self.smart_sched_v = vs
+            self.smart_T       = float(ts[-1])   # time of last node == intercept time
+            self.smart_T_tail  = 0.0
+            self.smart_T_total = float(ts[-1])
             self.smart_p0, self.smart_v0 = p0, v0
             self.smart_p1, self.smart_v1 = p1, v1
-            self.smart_path       = (xs_hermite, ys_hermite)
-            self.smart_decel_path = (xs_tail,    ys_tail)
-            self.smart_speed      = speed1
-            self.smart_u          = (v1[0] / speed1, v1[1] / speed1) if speed1 > 1e-9 else (0.0, 0.0)
-            self.smart_t0         = time.time()
+            self.smart_path       = (xs, ys)
+            self.smart_decel_path = ([], [])
+            self.smart_speed      = vs[-1]
+            self.smart_u          = (0.0, 0.0)   # optional
+            self.smart_t0         = t0
             self.smart_active     = True
-            self.smart_idx_int    = N           # split index for Hermite vs tail
+            self.smart_idx_int    = split_idx
             self.smart_version   += 1
             self.state.mode       = MODE_SMART
             self.smart_trace_x = [self.state.x]
@@ -503,7 +448,10 @@ class GantrySim:
 
             if st.mode == MODE_SMART and self.smart_active:
                 t = time.time() - self.smart_t0
-                if t <= self.smart_T_total and len(self.smart_sched_t) >= 2:
+                if t < 0.0:
+                    # planned to start in the future (LIVE alignment); keep current targets until start
+                    pass
+                elif t <= self.smart_T_total and len(self.smart_sched_t) >= 2:
                     # find bracketing knots
                     ts = self.smart_sched_t
                     xs = self.smart_sched_x
@@ -650,6 +598,14 @@ class GantrySim:
             st.thetaB = (st.thetaB + wB * DT) % (2.0 * math.pi)
 
         now = time.time()
+
+        if self.authority == "LIVE":
+            itc = self.itc_sub.try_get()
+            if itc:
+                # Recompute plan using the shared planner and time-align to intercept
+                # (arrive at intercept after itc.t_hit_s seconds from now)
+                self.plan_smart(itc.x_mm, itc.y_mm, 0.0, 0.0, t_hit_s=itc.t_hit_s)
+
         if self.live_hist_enabled:
             if now - self.hist_last >= 0.01:
                 self.hist_last = now
@@ -662,6 +618,10 @@ class GantrySim:
             # If disabled, keep it empty so plotting work is zero
             if self.hist:
                 self.hist.clear()
+        
+        if now - self.last_ctrl_pub > 0.25:  # publish at 4 Hz
+            self.ctrl_pub.publish({"mode": self.authority, "send_arduino": self.send_arduino}, ttl=1.0)
+            self.last_ctrl_pub = now
 
         if not self.performance_mode and now - self.last_status_time >= 1.0/STATUS_HZ:
             self.last_status_time = now
@@ -1028,6 +988,7 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy, get_show_trace)
             x, y   = sim.state.x, sim.state.y
             tx, ty = sim.target
             mode   = sim.state.mode
+            auth = sim.authority
             thA, thB = sim.state.thetaA, sim.state.thetaB
             vx_now, vy_now = sim.state.vx, sim.state.vy
 
@@ -1232,7 +1193,10 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy, get_show_trace)
             # And make sure the heavy collections don't accidentally show
             lc_hermite.set_segments([]); lc_tail.set_segments([])
 
-        spd_txt.set_text(f"Mode: {mode}")
+        if auth == "LIVE":
+            spd_txt.set_text(f"LIVE: mirroring physical system")
+        else:
+            spd_txt.set_text(f"Mode: {mode}")
         hud.set_text(f"Target: ({tx:.1f}, {ty:.1f})  |  Pos: ({x:.1f}, {y:.1f})")
         return ()
 
@@ -1275,6 +1239,36 @@ def run_control_panel(sim: GantrySim):
         QLabel { font-weight: normal; }
     """)
     root = QtWidgets.QVBoxLayout(w)
+
+    # --- Authority (SIM vs LIVE) ---
+    gb_auth = QtWidgets.QGroupBox("System Mode")
+    row = QtWidgets.QHBoxLayout(gb_auth)
+    rb_sim  = QtWidgets.QRadioButton("SIM (master)")
+    rb_live = QtWidgets.QRadioButton("LIVE (mirror)")
+
+    rb_sim.setChecked(sim.authority == "SIM")
+    rb_live.setChecked(sim.authority == "LIVE")
+
+    def on_auth_changed():
+        with sim.lock:
+            sim.authority = "LIVE" if rb_live.isChecked() else "SIM"
+        # Disable local motion controls in LIVE so sim doesn’t “command”
+        for grp in (gb_target, gb_shapes, gb_btns, gb_tests):
+            grp.setEnabled(rb_sim.isChecked())
+
+    rb_sim.toggled.connect(on_auth_changed)
+    rb_live.toggled.connect(on_auth_changed)
+
+    chk_send = QtWidgets.QCheckBox("Send to Arduino (LIVE only)")
+    chk_send.setChecked(False)
+    def on_send_toggled(v):
+        with sim.lock:
+            sim.send_arduino = bool(v)
+    chk_send.toggled.connect(on_send_toggled)
+    
+    row.addWidget(rb_sim); row.addWidget(rb_live)
+    row.addWidget(chk_send) 
+    root.addWidget(gb_auth)
 
     def mk_spin(val, step, minv, maxv, cb, decimals=3, width=90):
         spin = QtWidgets.QDoubleSpinBox()
