@@ -78,10 +78,10 @@ except Exception:
     serial = None
 
 try:
-    from Communications.ipc import ControlSubscriber, InterceptPublisher
+    from Communications.ipc import ControlListener, InterceptPublisher
 except Exception as e:
     print(f"[IPC] Warning: could not import Communications.ipc ({e}). Running without IPC.")
-    ControlSubscriber = None
+    ControlListener = None
     InterceptPublisher = None
 
 
@@ -433,7 +433,7 @@ class ReviewCapture:
 
 def main():
     # IPC: subscribe to authority (SIM/LIVE) and publish intercepts for the sim
-    ctrl_sub = ControlSubscriber() if ControlSubscriber else None
+    ctrl_sub = ControlListener() if ControlListener else None
     itc_pub  = InterceptPublisher() if InterceptPublisher else None
     last_pub_ts = 0.0
 
@@ -442,7 +442,7 @@ def main():
     send_arduino = False                 # sim checkbox; only matters in LIVE
     default_send_arduino = SEND_TO_ARDUINO  # fallback until sim tells us otherwise
 
-    sender = InterceptSender(True, SERIAL_PORT, SERIAL_BAUD)
+    sender = InterceptSender(SEND_TO_ARDUINO, SERIAL_PORT, SERIAL_BAUD)
 
     # RealSense setup (unchanged)
     pipeline = rs.pipeline()

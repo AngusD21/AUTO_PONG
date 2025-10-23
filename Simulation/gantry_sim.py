@@ -187,6 +187,25 @@ class GantrySim:
             'r_vert_top':0.0, 'r_vert_bot':0.0,
         }
 
+        # --- Comms ---
+        self.hw = None
+        self.hw_port = os.getenv("ARDUINO_PORT", "COM3")  # e.g. /dev/ttyACM0 on Linux
+        self.hw_baud = 115200
+        self.hw_status = "Disconnected"
+
+        self._last_hw_tx = 0.0
+        self._hw_min_period = 1.0 / 60.0
+        self._last_mode_sent = None
+        self._last_hw_cmd = None
+        self.tx_blink_until = 0.0  # for UI indicator
+
+        # Try initial connect (optional)
+        try:
+            self.connect_hw(self.hw_port, self.hw_baud)
+        except Exception as e:
+            print("[HW] Not connected:", e)
+
+
     # ---------------------------------
     # Command Handling
     # ---------------------------------
@@ -441,6 +460,96 @@ class GantrySim:
                 break
 
         return xs, ys, t
+    
+    def connect_hw(self, port: str, baud: int = 115200):
+        """(Re)connect to Arduino on a given port."""
+        with self.lock:
+            # clean up any existing connection
+            try:
+                if self.hw and hasattr(self.hw, "close"):
+                    self.hw.close()
+            except Exception:
+                pass
+            self.hw = None
+            self.hw_port = port
+            self.hw_baud = baud
+        try:
+            hw = Gantry(port=port, baud=baud)
+            with self.lock:
+                self.hw = hw
+                self.hw_status = f"Connected: {port} @ {baud}"
+                self._last_hw_cmd = None
+                self._last_mode_sent = None
+            print("[HW]", self.hw_status)
+        except Exception as e:
+            with self.lock:
+                self.hw_status = f"ERROR: {e}"
+                self.hw = None
+            print("[HW] Connect failed:", e)
+            raise
+
+    def disconnect_hw(self):
+        with self.lock:
+            try:
+                if self.hw and hasattr(self.hw, "close"):
+                    self.hw.close()
+            except Exception:
+                pass
+            self.hw = None
+            self.hw_status = "Disconnected"
+            self._last_hw_cmd = None
+            self._last_mode_sent = None
+        print("[HW] Disconnected")
+
+    def _hw_send(self, s: str, force=False):
+        if not self.hw:
+            return
+        if not s.endswith("\n"):
+            s += "\n"
+        if not force and s == self._last_hw_cmd:
+            return
+        try:
+            sent = False
+            # 1) Your wrapper might have one of these
+            if hasattr(self.hw, "send_line"):
+                self.hw.send_line(s)                    # preferred if it exists
+                sent = True
+            elif hasattr(self.hw, "write_line"):
+                self.hw.write_line(s)
+                sent = True
+            elif hasattr(self.hw, "send"):
+                self.hw.send(s)                         # may expect newline included
+                sent = True
+            elif hasattr(self.hw, "write"):
+                self.hw.write(s.encode("ascii", "replace"))
+                sent = True
+            # 2) Or it may expose the underlying pyserial as .ser or .serial
+            elif hasattr(self.hw, "ser") and hasattr(self.hw.ser, "write"):
+                self.hw.ser.write(s.encode("ascii", "replace"))
+                if hasattr(self.hw.ser, "flush"):
+                    try: self.hw.ser.flush()
+                    except Exception: pass
+                sent = True
+            elif hasattr(self.hw, "serial") and hasattr(self.hw.serial, "write"):
+                self.hw.serial.write(s.encode("ascii", "replace"))
+                if hasattr(self.hw.serial, "flush"):
+                    try: self.hw.serial.flush()
+                    except Exception: pass
+                sent = True
+
+            if not sent:
+                raise AttributeError("No known send method on Gantry (tried send_line, write_line, send, write, ser.write, serial.write)")
+
+            # record + blink
+            self._last_hw_cmd = s
+            self.tx_blink_until = time.time() + 0.20
+            self.hw_status = f"TX: {s.strip()}"
+
+        except Exception as e:
+            self.hw_status = f"TX error: {e}"
+            self.tx_blink_until = time.time() + 0.20   # still blink on attempt
+            print("[HW] send failed:", e)
+
 
     def update(self, dt):
         with self.lock:
@@ -627,6 +736,43 @@ class GantrySim:
             self.last_status_time = now
             print(self.build_status(), flush=True)
 
+        if (self.authority == "SIM" and self.send_arduino and self.hw and (now - self._last_hw_tx) >= self._hw_min_period):
+
+            m = self.state.mode
+            tx, ty = self.target
+
+            if m == MODE_STOP:
+                if self._last_mode_sent != MODE_STOP:
+                    self._hw_send("X", force=True)
+                    self._last_mode_sent = MODE_STOP
+
+            elif m == MODE_REHOME:
+                if self._last_mode_sent != MODE_REHOME:
+                    self._hw_send("R", force=True)
+                    self._last_mode_sent = MODE_REHOME
+
+            elif m == MODE_IDLE:
+                # Tell Arduino to idle once; don't stream targets in idle
+                if self._last_mode_sent != MODE_IDLE:
+                    self._hw_send("I", force=True)
+                    self._last_mode_sent = MODE_IDLE
+
+            elif m == MODE_TARGET:
+                self._hw_send(f"T,{tx:.1f},{ty:.1f}")
+                self._last_mode_sent = MODE_TARGET
+
+            elif m == MODE_SMART:
+                # Optional: include vx,vy if you want (Arduino ignores them by default)
+                # Here we just send zeros unless you compute them from schedule slope.
+                self._hw_send(f"U,{tx:.1f},{ty:.1f},0.0,0.0")
+                self._last_mode_sent = MODE_SMART
+
+            else:
+                # C, S, M: high-level PC-only modes → stream targets as T
+                self._hw_send(f"T,{tx:.1f},{ty:.1f}")
+                self._last_mode_sent = m
+            self._last_hw_tx = now
+
     # ---------------------------------
     # Networking
     # ---------------------------------
@@ -794,6 +940,13 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy, get_show_trace)
     smart_tail_simple, = ax.plot([], [], linestyle=(0,(1,2)), lw=2.0, color='red', alpha=0.55, zorder=5)
 
     actual_path_line, = ax.plot([], [], '-', color='black', alpha=0.28, linewidth=2.0, zorder=8)
+
+    # --- Serial TX indicator (axes coords, top-left) ---
+    tx_led = Circle((0.06, 0.96), radius=0.02, transform=ax.transAxes,
+                    facecolor='lightgray', edgecolor='black', linewidth=0.8, zorder=12)
+    ax.add_patch(tx_led)
+    tx_lbl = ax.text(0.095, 0.96, "TX", transform=ax.transAxes, va='center', ha='left',
+                    fontsize=9, fontweight='bold', color='gray', zorder=12)
 
     def refresh_dims():
         ax.set_xlim(-FRAME_MARGIN, X_MAX + FRAME_MARGIN)
@@ -1198,6 +1351,17 @@ def build_sim_canvas(sim: GantrySim, get_smart_vx, get_smart_vy, get_show_trace)
         else:
             spd_txt.set_text(f"Mode: {mode}")
         hud.set_text(f"Target: ({tx:.1f}, {ty:.1f})  |  Pos: ({x:.1f}, {y:.1f})")
+
+
+        # Blink when we’ve transmitted recently
+        if not sim.performance_mode:
+            blink = False
+            with sim.lock:
+                blink = (sim.hw is not None and sim.send_arduino and sim.authority == "SIM"
+                        and time.time() < sim.tx_blink_until)
+            if blink: tx_led.set_facecolor('limegreen')
+            else: tx_led.set_facecolor('lightgray')
+
         return ()
 
     ani = FuncAnimation(fig, update_plot, interval=1000/60.0)
@@ -1259,7 +1423,7 @@ def run_control_panel(sim: GantrySim):
     rb_sim.toggled.connect(on_auth_changed)
     rb_live.toggled.connect(on_auth_changed)
 
-    chk_send = QtWidgets.QCheckBox("Send to Arduino (LIVE only)")
+    chk_send = QtWidgets.QCheckBox("Send to Arduino")
     chk_send.setChecked(False)
     def on_send_toggled(v):
         with sim.lock:
@@ -1290,6 +1454,50 @@ def run_control_panel(sim: GantrySim):
         row.addWidget(spin_right)
         row.addStretch(1)
         return row
+    
+    # --- Hardware I/O ---
+    gb_hw = QtWidgets.QGroupBox("Hardware I/O")
+    lay_hw = QtWidgets.QVBoxLayout(gb_hw)
+
+    row_port = QtWidgets.QHBoxLayout()
+    port_edit = QtWidgets.QLineEdit()
+    port_edit.setPlaceholderText("e.g. COM3 or /dev/ttyACM0")
+    port_edit.setText(sim.hw_port)
+    baud_spin = QtWidgets.QSpinBox()
+    baud_spin.setRange(1200, 1000000)
+    baud_spin.setSingleStep(1200)
+    baud_spin.setValue(sim.hw_baud)
+
+    btn_connect = QtWidgets.QPushButton("Connect")
+    btn_disconnect = QtWidgets.QPushButton("Disconnect")
+    status_lbl = QtWidgets.QLabel(sim.hw_status)
+
+    def do_connect():
+        port = port_edit.text().strip()
+        baud = int(baud_spin.value())
+        try:
+            sim.connect_hw(port, baud)
+        except Exception:
+            pass  # status is set inside connect_hw
+        status_lbl.setText(sim.hw_status)
+
+    def do_disconnect():
+        sim.disconnect_hw()
+        status_lbl.setText(sim.hw_status)
+
+    btn_connect.clicked.connect(do_connect)
+    btn_disconnect.clicked.connect(do_disconnect)
+
+    row_port.addWidget(QtWidgets.QLabel("Port:"))
+    row_port.addWidget(port_edit, 1)
+    row_port.addWidget(QtWidgets.QLabel("Baud:"))
+    row_port.addWidget(baud_spin)
+    row_port.addWidget(btn_connect)
+    row_port.addWidget(btn_disconnect)
+
+    lay_hw.addLayout(row_port)
+    lay_hw.addWidget(status_lbl)
+    root.addWidget(gb_hw)
 
     # --- Geometry / Params ---
     gb_geo = QtWidgets.QGroupBox("Geometry & Params")

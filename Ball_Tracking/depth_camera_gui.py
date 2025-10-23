@@ -13,6 +13,9 @@ import serial
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyrealsense2 as rs
 
+from Ball_Tracking.review_wizard import ReviewPage, VideoLabel, qimage_from_bgr
+from Ball_Tracking.plane_wizard import PlaneSetupWizard, TablePlane
+
 try:
 	from Communications.ipc import ControlListener, InterceptPublisher
 except Exception as e:
@@ -272,11 +275,7 @@ def colourise_depth(depth_u16: np.ndarray,
 
     return vis_bgr
 
-def qimage_from_bgr(img_bgr):
-	h, w = img_bgr.shape[:2]
-	rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-	qimg = QtGui.QImage(rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
-	return qimg.copy()
+
 
 def predict_radius(calib_r_px, calib_depth_mm, current_depth_mm):
 	if current_depth_mm <= 0 or calib_depth_mm is None or calib_r_px is None:
@@ -436,6 +435,15 @@ class CameraWorker(QtCore.QThread):
 		self.crop_left = 0.0
 		self.crop_right = 0.0
 
+		# Plane setup
+		self.search_box = None
+		self._last_cloud = None
+		self._cloud_lock = threading.Lock()
+		self._cloud_stride = 4
+		self._cloud_every = 3
+		self._cloud_counter = 0
+		self.pc = None
+
 		# IPC / authority
 		self.ctrl = ControlListener() if ControlListener else None
 		self.itc_pub = InterceptPublisher() if InterceptPublisher else None
@@ -523,6 +531,8 @@ class CameraWorker(QtCore.QThread):
 			except Exception:
 				self.intrinsics = None
 
+			self.pc = rs.pointcloud() if want_depth else None
+
 			# (Re)build ReviewCapture with current scale/intrinsics
 			self.review = ReviewCapture(
 				enabled=self.enable_record,
@@ -567,12 +577,19 @@ class CameraWorker(QtCore.QThread):
 			# Reset per-stream flags so the next _open_camera() sets them afresh
 			self.has_rgb = False
 			self.intrinsics = None
+			self.pc = None
+			self._last_cloud = None
 			# Let the UI know the camera is now “down”
 			try:
 				self.camera_ok.emit(False)
 			except Exception:
 				pass
-
+	
+	def get_point_cloud_snapshot(self):
+		with self._cloud_lock:
+			if self._last_cloud is None:
+				return None
+			return self._last_cloud.copy()
 	
 	# ---------- Request reconfiguration ----------
 	@QtCore.pyqtSlot(bool, bool, bool)
@@ -685,6 +702,7 @@ class CameraWorker(QtCore.QThread):
 			# Fast mode
 			if self.req_fast:
 				self.status.emit("Camera: FAST mode (no live feed)")
+				time.sleep(0.01)
 				continue
 			
 			if not ok:
@@ -734,10 +752,7 @@ class CameraWorker(QtCore.QThread):
 				depth_u16 = np.asanyarray(depth_frame.get_data())
 				h, w = depth_u16.shape
 				show_bgr = colourise_depth(depth_u16, self.depth_scale)
-			elif self.view_mode == "RGB" and colour_frame is not None:
-				colour_im = colour_frame.get_data()
-				h, w = colour_im.shape[:2]
-				show_bgr = np.asanyarray(colour_im).copy()
+
 			elif self.view_mode == "Both" and colour_frame is not None:
 				depth_u16 = np.asanyarray(depth_frame.get_data())
 				h, w = depth_u16.shape
@@ -745,116 +760,139 @@ class CameraWorker(QtCore.QThread):
 				c = np.asanyarray(colour_frame.get_data()).copy()
 				show_bgr = np.hstack([d, c])
 
-			# Meta per-frame (for review)
-			meta = {
-				"ts": time.time(),
-				"pred_px": None,
-				"meas_px": None,
-				"state": self.ekf.x.tolist() if self.ekf is not None else None,
-				"intercept_t": None,
-				"intercept_xyz": None,
-				"dt": EKF_DT
-			}
+			elif self.view_mode == "RGB" and colour_frame is not None:
+				colour_im = colour_frame.get_data()
+				h, w = colour_im.shape[:2]
+				show_bgr = np.asanyarray(colour_im).copy()
 
-			# ===== Tracking =====
-			if not self.detected:
-				info = self._global_detect(depth_u16)
-				if info is not None:
-					(cx, cy), r_px, depth_m = info
-					self.ball_depth_mm = depth_m * 1000.0
-					self.calib_radius_px = r_px
-					self.calib_depth_mm = self.ball_depth_mm
 
-					p3d = rs.rs2_deproject_pixel_to_point(self.intrinsics, [float(cx), float(cy)], float(depth_m))
-					p3d = np.asarray(p3d, float)
-					self.ekf = EKF3DDrag(dt=EKF_DT, g=G_VECTOR, beta_drag=BETA_DRAG, Q_pos=Q_POS, Q_vel=Q_VEL, R_xyz=R_XYZ)
-					self.ekf.initialize(p3d, v_xyz=None)
+			# If RGB only, no tracking
+			if self.view_mode != "RGB":
+				# Meta per-frame (for review)
+				meta = {
+					"ts": time.time(),
+					"pred_px": None,
+					"meas_px": None,
+					"state": self.ekf.x.tolist() if self.ekf is not None else None,
+					"intercept_t": None,
+					"intercept_xyz": None,
+					"dt": EKF_DT
+				}
 
-					self.ball_centers_px = [(cx, cy)]
-					self.detected = True
-					self.undetected_count = 0
+				# Point cloud
+				if self.pc is not None:
+					self._cloud_counter = (self._cloud_counter + 1) % self._cloud_every
+					if self._cloud_counter == 0:
+						try:
+							points = self.pc.calculate(depth_frame)
+							v = np.asanyarray(points.get_vertices())
+							xyz = np.asarray(v.tolist()).reshape(-1, 3)
+							m = np.isfinite(xyz).all(axis=1) & (xyz[:,2] > 0)
+							xyz = xyz[m][::self._cloud_stride]
+							with self._cloud_lock:
+								self._last_cloud = xyz
+						except Exception:
+							pass
 
-					if self.enable_record:
-						self.review.start()
+				# ===== Tracking =====
+				if not self.detected:
+					info = self._global_detect(depth_u16)
+					if info is not None:
+						(cx, cy), r_px, depth_m = info
+						self.ball_depth_mm = depth_m * 1000.0
+						self.calib_radius_px = r_px
+						self.calib_depth_mm = self.ball_depth_mm
 
-					meta["meas_px"] = (cx, cy)
-					meta["state"] = self.ekf.x.tolist()
-					self.event.emit(f"Ball detected at ({cx},{cy})")
+						p3d = rs.rs2_deproject_pixel_to_point(self.intrinsics, [float(cx), float(cy)], float(depth_m))
+						p3d = np.asarray(p3d, float)
+						self.ekf = EKF3DDrag(dt=EKF_DT, g=G_VECTOR, beta_drag=BETA_DRAG, Q_pos=Q_POS, Q_vel=Q_VEL, R_xyz=R_XYZ)
+						self.ekf.initialize(p3d, v_xyz=None)
 
-					if show_bgr is not None:
-						cv2.circle(show_bgr, (cx, cy), int(r_px), (0,255,0), 2)
-				else:
-					pass
-			else:
-				# Predict
-				self.ekf.predict()
-				p_pred = self.ekf.x[:3].tolist()
-				try:
-					pred_px = rs.rs2_project_point_to_pixel(self.intrinsics, p_pred)
-				except Exception:
-					pred_px = self.ball_centers_px[-1] if self.ball_centers_px else (w//2, h//2)
-				pred_px = (int(np.clip(pred_px[0],0,w-1)), int(np.clip(pred_px[1],0,h-1)))
-				meta["pred_px"] = pred_px
-				meta["state"] = self.ekf.x.tolist()
-
-				exp_r_px = predict_radius(self.calib_radius_px, self.calib_depth_mm, self.ball_depth_mm or (self.calib_depth_mm or 1000.0))
-				centre_info, depth_mm_found = self._focus_detect(
-					depth_u16, self.ball_depth_mm or self.calib_depth_mm or 1000.0,
-					exp_r_px, pred_px
-				)
-
-				if centre_info is not None and depth_mm_found is not None:
-					cx, cy = centre_info
-					depth_m = depth_mm_found / 1000.0
-					meas_p3d = rs.rs2_deproject_pixel_to_point(self.intrinsics, [float(cx), float(cy)], float(depth_m))
-					meas_p3d = np.asarray(meas_p3d, float)
-					self.ekf.update_xyz(meas_p3d, gate_alpha=GATE_ALPHA)
-
-					self.ball_depth_mm = depth_mm_found
-					self.ball_centers_px.append((cx, cy)); self.ball_centers_px = self.ball_centers_px[-2:]
-					self.undetected_count = 0
-
-					# Intercept + comms
-					t_hit, p_hit = self.ekf.predict_intercept_with_plane(PLANE_NORMAL, PLANE_D, t_max=2.0)
-					if t_hit is not None and p_hit is not None:
-						now = time.time()
-						# Publish to SIM (rate-limited)
-						if (authority == "LIVE") and self.itc_pub and (now - self.last_pub_ts) >= IPC_MIN_PERIOD_S:
-							try:
-								self.itc_pub.publish(x_mm=float(p_hit[0])*1000.0,
-													y_mm=float(p_hit[1])*1000.0,
-													t_hit_s=float(t_hit),
-													source="tracker")
-								self.last_pub_ts = now
-							except Exception as e:
-								self.event.emit(f"[IPC] publish failed: {e}")
-
-						# Arduino (only in LIVE and if enabled)
-						if (authority == "LIVE") and self.send_to_arduino:
-							self.serial_sender.send(p_hit[0], p_hit[1], t_hit)
-
-						meta["intercept_t"] = float(t_hit)
-						meta["intercept_xyz"] = [float(p_hit[0]), float(p_hit[1]), float(p_hit[2])]
-
-					meta["meas_px"] = (cx, cy)
-
-					if show_bgr is not None and self.view_mode != "Fast":
-						cv2.circle(show_bgr, (cx, cy), int(exp_r_px), (0,255,0), 2)
-						cv2.circle(show_bgr, pred_px, SEARCH_RADIUS_PX, (255,255,255), 1, lineType=cv2.LINE_AA)
-				else:
-					self.undetected_count += 1
-					if self.undetected_count > 10:
-						if self.enable_record and self.review.active:
-							self.review.stop_and_render()
-						self.detected = False
-						self.ekf = None
-						self.ball_centers_px.clear()
+						self.ball_centers_px = [(cx, cy)]
+						self.detected = True
 						self.undetected_count = 0
-						self.event.emit("Ball lost.")
 
-			# Review tick
-			if self.enable_record:
-				self.review.tick(depth_u16, meta)
+						if self.enable_record:
+							self.review.start()
+
+						meta["meas_px"] = (cx, cy)
+						meta["state"] = self.ekf.x.tolist()
+						self.event.emit(f"Ball detected at ({cx},{cy})")
+
+						if show_bgr is not None:
+							cv2.circle(show_bgr, (cx, cy), int(r_px), (0,255,0), 2)
+					else:
+						pass
+				else:
+					# Predict
+					self.ekf.predict()
+					p_pred = self.ekf.x[:3].tolist()
+					try:
+						pred_px = rs.rs2_project_point_to_pixel(self.intrinsics, p_pred)
+					except Exception:
+						pred_px = self.ball_centers_px[-1] if self.ball_centers_px else (w//2, h//2)
+					pred_px = (int(np.clip(pred_px[0],0,w-1)), int(np.clip(pred_px[1],0,h-1)))
+					meta["pred_px"] = pred_px
+					meta["state"] = self.ekf.x.tolist()
+
+					exp_r_px = predict_radius(self.calib_radius_px, self.calib_depth_mm, self.ball_depth_mm or (self.calib_depth_mm or 1000.0))
+					centre_info, depth_mm_found = self._focus_detect(
+						depth_u16, self.ball_depth_mm or self.calib_depth_mm or 1000.0,
+						exp_r_px, pred_px
+					)
+
+					if centre_info is not None and depth_mm_found is not None:
+						cx, cy = centre_info
+						depth_m = depth_mm_found / 1000.0
+						meas_p3d = rs.rs2_deproject_pixel_to_point(self.intrinsics, [float(cx), float(cy)], float(depth_m))
+						meas_p3d = np.asarray(meas_p3d, float)
+						self.ekf.update_xyz(meas_p3d, gate_alpha=GATE_ALPHA)
+
+						self.ball_depth_mm = depth_mm_found
+						self.ball_centers_px.append((cx, cy)); self.ball_centers_px = self.ball_centers_px[-2:]
+						self.undetected_count = 0
+
+						# Intercept + comms
+						t_hit, p_hit = self.ekf.predict_intercept_with_plane(PLANE_NORMAL, PLANE_D, t_max=2.0)
+						if t_hit is not None and p_hit is not None:
+							now = time.time()
+							# Publish to SIM (rate-limited)
+							if (authority == "LIVE") and self.itc_pub and (now - self.last_pub_ts) >= IPC_MIN_PERIOD_S:
+								try:
+									self.itc_pub.publish(x_mm=float(p_hit[0])*1000.0,
+														y_mm=float(p_hit[1])*1000.0,
+														t_hit_s=float(t_hit),
+														source="tracker")
+									self.last_pub_ts = now
+								except Exception as e:
+									self.event.emit(f"[IPC] publish failed: {e}")
+
+							# Arduino (only in LIVE and if enabled)
+							if (authority == "LIVE") and self.send_to_arduino:
+								self.serial_sender.send(p_hit[0], p_hit[1], t_hit)
+
+							meta["intercept_t"] = float(t_hit)
+							meta["intercept_xyz"] = [float(p_hit[0]), float(p_hit[1]), float(p_hit[2])]
+
+						meta["meas_px"] = (cx, cy)
+
+						if show_bgr is not None and self.view_mode != "Fast":
+							cv2.circle(show_bgr, (cx, cy), int(exp_r_px), (0,255,0), 2)
+							cv2.circle(show_bgr, pred_px, SEARCH_RADIUS_PX, (255,255,255), 1, lineType=cv2.LINE_AA)
+					else:
+						self.undetected_count += 1
+						if self.undetected_count > 10:
+							if self.enable_record and self.review.active:
+								self.review.stop_and_render()
+							self.detected = False
+							self.ekf = None
+							self.ball_centers_px.clear()
+							self.undetected_count = 0
+							self.event.emit("Ball lost.")
+
+				# Review tick
+				if self.enable_record:
+					self.review.tick(depth_u16, meta)
 
 			if (show_bgr is not None) and (self.view_mode != "Fast"):
 				self.frame.emit(qimage_from_bgr(show_bgr))
@@ -891,13 +929,6 @@ class CameraWorker(QtCore.QThread):
 
 
 # ========================== GUI main window =======================
-class VideoLabel(QtWidgets.QLabel):
-	def __init__(self):
-		super().__init__()
-		self.setAlignment(QtCore.Qt.AlignCenter)
-		self.setMinimumSize(640, 480)
-		self.setStyleSheet("background-color: black;")
-
 
 class MainWindow(QtWidgets.QMainWindow):
 	def __init__(self):
@@ -909,11 +940,11 @@ class MainWindow(QtWidgets.QMainWindow):
 		app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 		apply_dark_theme(app)
 
-		# Central content: stacked live/review
+		# Stacked central content: video label (main) vs plane setup
 		self.stack = QtWidgets.QStackedWidget()
 		self.setCentralWidget(self.stack)
 
-		# Page 0: Live (your existing live VideoLabel)
+		# Page 0: Live
 		self.video = VideoLabel()
 		live_page = QtWidgets.QWidget()
 		live_layout = QtWidgets.QVBoxLayout(live_page)
@@ -925,6 +956,10 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.review_page = ReviewPage()
 		self.stack.addWidget(self.review_page)  # index 1
 		self.review_page.request_return.connect(self._return_to_live)
+
+		# Page 2: Plane setup
+		self.plane_setup = PlaneSetupWizard(worker=None, parent=self)
+		self.stack.addWidget(self.plane_setup) # index 2
 
 		# --- Right dock = controls ---
 		dock = QtWidgets.QDockWidget("", self)
@@ -994,13 +1029,18 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.send_chk = QtWidgets.QCheckBox("Send to Arduino (LIVE only)")
 		self.send_chk.setChecked(SEND_TO_ARDUINO_DEFAULT)
 
-		self.rec_chk = QtWidgets.QCheckBox("Enable recording (review)")
+		self.rec_chk = QtWidgets.QCheckBox("Enable Recording")
 		self.rec_chk.setChecked(False)
 
-		self.btn_load_review = QtWidgets.QPushButton("Load review.mp4…")
+		self.btn_load_review = QtWidgets.QPushButton("Review Wizard")
+		self.btn_plane = QtWidgets.QPushButton("Plane Wizard")
 
-		card_send = make_card(self.send_chk, self.rec_chk, self.btn_load_review)
+		card_send = make_card(self.send_chk, self.rec_chk, self.btn_load_review, self.btn_plane)
 		root.addWidget(card_send)
+
+		self.btn_plane.clicked.connect(self._enter_plane_setup)
+		self.plane_setup.saved.connect(self._plane_saved)
+		self.plane_setup.canceled.connect(self._plane_canceled)
 
 		# --- ROI sliders card ---
 		roi_box = QtWidgets.QWidget()
@@ -1060,6 +1100,8 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.worker.event.connect(self.on_event)
 		self.worker.camera_ok.connect(self.on_camera_ok)
 
+		self.plane_setup._set_worker(self.worker)
+
 		self.chk_depth.toggled.connect(self._apply_streams)
 		self.chk_rgb.toggled.connect(self._apply_streams)
 		self.chk_fast.toggled.connect(self._apply_streams)
@@ -1077,11 +1119,11 @@ class MainWindow(QtWidgets.QMainWindow):
 	def closeEvent(self, e):
 		self.worker.stop()
 		self.worker.wait(1500)
-		try:
-			if self.rev_cap:
-				self.rev_cap.release()
-		except Exception:
-			pass
+		# try:
+		# 	if self.rev_cap:
+		# 		self.rev_cap.release()
+		# except Exception:
+		# 	pass
 		return super().closeEvent(e)
 	
 	def _enter_review(self, path: str):
@@ -1099,6 +1141,26 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.worker = CameraWorker()
 		self._wire_worker_signals()  # helper to reconnect signals
 		self.worker.start()
+
+	def _enter_plane_setup(self):
+		# give the wizard the current worker before showing it
+		self.plane_setup._set_worker(self.worker)
+		# hide the right dock while in the wizard
+		self.findChild(QtWidgets.QDockWidget, "rightDock").hide()
+		# show plane wizard page
+		self.stack.setCurrentWidget(self.plane_setup)
+		self.on_event("Plane setup: entering")
+
+	def _plane_canceled(self):
+		self.on_event("Plane setup: canceled")
+		self.stack.setCurrentIndex(0)  # back to live
+		self.findChild(QtWidgets.QDockWidget, "rightDock").show()
+
+	def _plane_saved(self, box):
+		self.on_event(f"Plane setup: saved box {box}")
+		self.worker.search_box = box
+		self.stack.setCurrentIndex(0)  # back to live
+		self.findChild(QtWidgets.QDockWidget, "rightDock").show()
 
 	def _wire_worker_signals(self):
 		self.worker.frame.connect(self.on_frame)
@@ -1176,41 +1238,41 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.on_event(f"Loaded review: {path}")
 		self._enter_review(path)
 
-		if not path:
-			return
-		try:
-			if self.rev_cap:
-				self.rev_cap.release()
-			self.rev_cap = cv2.VideoCapture(path)
-			self.rev_total = int(self.rev_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-			self.scrub.setRange(0, max(0, self.rev_total-1))
-			self.scrub.setEnabled(True)
-			self.btn_play.setEnabled(True)
-			self.rev_play = False
-			self._show_review_frame(0)
-			self.on_event(f"Loaded review: {path}")
-		except Exception as e:
-			self.on_event(f"Failed to load review: {e}")
+		# if not path:
+		# 	return
+		# try:
+		# 	if self.rev_cap:
+		# 		self.rev_cap.release()
+		# 	self.rev_cap = cv2.VideoCapture(path)
+		# 	self.rev_total = int(self.rev_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+		# 	self.scrub.setRange(0, max(0, self.rev_total-1))
+		# 	self.scrub.setEnabled(True)
+		# 	self.btn_play.setEnabled(True)
+		# 	self.rev_play = False
+		# 	self._show_review_frame(0)
+		# 	self.on_event(f"Loaded review: {path}")
+		# except Exception as e:
+		# 	self.on_event(f"Failed to load review: {e}")
 
-	def _show_review_frame(self, idx):
-		if not self.rev_cap: return
-		self.rev_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-		ok, frame = self.rev_cap.read()
-		if not ok: return
-		self.on_frame(qimage_from_bgr(frame))
+	# def _show_review_frame(self, idx):
+	# 	if not self.rev_cap: return
+	# 	self.rev_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+	# 	ok, frame = self.rev_cap.read()
+	# 	if not ok: return
+	# 	self.on_frame(qimage_from_bgr(frame))
 
-	def _tick_review(self):
-		if not (self.rev_cap and self.rev_play): return
-		pos = int(self.rev_cap.get(cv2.CAP_PROP_POS_FRAMES))
-		ok, frame = self.rev_cap.read()
-		if not ok:
-			self.rev_play = False
-			self.rev_timer.stop()
-			return
-		self.on_frame(qimage_from_bgr(frame))
-		self.scrub.blockSignals(True)
-		self.scrub.setValue(min(self.rev_total-1, pos))
-		self.scrub.blockSignals(False)
+	# def _tick_review(self):
+	# 	if not (self.rev_cap and self.rev_play): return
+	# 	pos = int(self.rev_cap.get(cv2.CAP_PROP_POS_FRAMES))
+	# 	ok, frame = self.rev_cap.read()
+	# 	if not ok:
+	# 		self.rev_play = False
+	# 		self.rev_timer.stop()
+	# 		return
+	# 	self.on_frame(qimage_from_bgr(frame))
+	# 	self.scrub.blockSignals(True)
+	# 	self.scrub.setValue(min(self.rev_total-1, pos))
+	# 	self.scrub.blockSignals(False)
 	
 	def _on_toggle_record(self, v):
 		v = bool(v)
@@ -1224,137 +1286,6 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.on_event(f"Review capture {'ENABLED' if v else 'DISABLED'}")
 	
 
-
-# =========================== REVIEW UI =========================
-class ReviewPage(QtWidgets.QWidget):
-    """Standalone review player: big video, long slider, play/pause, arrow-key frame step."""
-    request_return = QtCore.pyqtSignal()  # emitted when user clicks Return
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(12, 12, 12, 12)
-        v.setSpacing(8)
-
-        # Video area
-        self.video = VideoLabel() 
-        v.addWidget(self.video, 1)
-
-        # Long scrub + controls
-        ctrl = QtWidgets.QHBoxLayout()
-        self.btn_return = QtWidgets.QPushButton("← Return to Live")
-        self.btn_play   = QtWidgets.QPushButton("Play")
-        self.btn_play.setCheckable(True)
-        self.lbl_time   = QtWidgets.QLabel("00:00 / 00:00")
-        self.lbl_time.setMinimumWidth(120)
-        ctrl.addWidget(self.btn_return)
-        ctrl.addStretch(1)
-        ctrl.addWidget(self.btn_play)
-        ctrl.addSpacing(8)
-        ctrl.addWidget(self.lbl_time)
-        v.addLayout(ctrl)
-
-        self.scrub = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.scrub.setRange(0, 0)
-        self.scrub.setSingleStep(1)
-        v.addWidget(self.scrub)
-
-        # Player state
-        self.cap = None
-        self.total = 0
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self._tick)
-
-        # Wire
-        self.btn_return.clicked.connect(self.request_return.emit)
-        self.btn_play.toggled.connect(self._toggle_play)
-        self.scrub.valueChanged.connect(self._scrub_to)
-
-        # Keyboard focus for arrow keys
-        self.setFocusPolicy(QtCore.Qt.StrongFocus)
-
-    def load_video(self, path: str):
-        # close previous
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-        self.cap = cv2.VideoCapture(path)
-        if not self.cap or not self.cap.isOpened():
-            QtWidgets.QMessageBox.warning(self, "Load failed", f"Could not open:\n{path}")
-            return False
-        self.total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.scrub.setRange(0, max(0, self.total - 1))
-        self._show_frame(0)
-        self.btn_play.setChecked(False)  # paused by default
-        self._update_time_label(0)
-        return True
-
-    def _update_time_label(self, idx):
-        if not self.cap or self.total <= 0:
-            self.lbl_time.setText("00:00 / 00:00")
-            return
-        fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
-        cur_s = idx / fps
-        tot_s = self.total / fps
-        def mmss(t): return f"{int(t//60):02d}:{int(t%60):02d}"
-        self.lbl_time.setText(f"{mmss(cur_s)} / {mmss(tot_s)}")
-
-    def _show_frame(self, idx):
-        if not self.cap: return
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-        ok, frame = self.cap.read()
-        if not ok: return
-        qimg = qimage_from_bgr(frame)
-        self.video.setPixmap(QtGui.QPixmap.fromImage(qimg).scaled(
-            self.video.width(), self.video.height(),
-            QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
-        ))
-
-    def _tick(self):
-        if not self.cap: return
-        pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-        ok, frame = self.cap.read()
-        if not ok:
-            self.btn_play.setChecked(False)  # stop
-            return
-        qimg = qimage_from_bgr(frame)
-        self.video.setPixmap(QtGui.QPixmap.fromImage(qimg).scaled(
-            self.video.width(), self.video.height(),
-            QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
-        ))
-        self.scrub.blockSignals(True)
-        self.scrub.setValue(min(self.total-1, pos))
-        self.scrub.blockSignals(False)
-        self._update_time_label(pos)
-
-    def _toggle_play(self, playing: bool):
-        if playing:
-            self.btn_play.setText("Pause")
-            self.timer.start(33)  # ~30fps
-        else:
-            self.btn_play.setText("Play")
-            self.timer.stop()
-
-    def _scrub_to(self, idx: int):
-        self._show_frame(int(idx))
-        self._update_time_label(int(idx))
-
-    # Arrow keys: when paused, step ±1 frame
-    def keyPressEvent(self, e: QtGui.QKeyEvent):
-        if not self.cap:
-            return super().keyPressEvent(e)
-        if e.key() in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right):
-            if self.timer.isActive():
-                return  # ignore while playing
-            cur = self.scrub.value()
-            delta = -1 if e.key() == QtCore.Qt.Key_Left else 1
-            nxt = int(np.clip(cur + delta, 0, max(0, self.total-1)))
-            self.scrub.setValue(nxt)
-            self._show_frame(nxt)
-            self._update_time_label(nxt)
-        else:
-            super().keyPressEvent(e)
-			
 
 def main():
 	app = QtWidgets.QApplication(sys.argv)
