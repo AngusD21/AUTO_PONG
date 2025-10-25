@@ -186,7 +186,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 
 		# ---------- PLANE ROI CARD ----------
 		if 1:
-			card_box = CollapsibleCard("PLANE POINTS ROI")
+			card_box = CollapsibleCard("SELECT PLANE POINTS")
 			# header full width + centered text
 			card_box._button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 			card_box._button.setStyleSheet(card_box._button.styleSheet() + " text-align:center;")
@@ -262,7 +262,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		
 		# ---------- PLANE CARD ----------
 		if 1:
-			card_pln = CollapsibleCard("PLANE (FIT & ADJUST)")
+			card_pln = CollapsibleCard("GENERATE PLANE")
 			card_pln._button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 			card_pln._button.setStyleSheet(card_pln._button.styleSheet() + " text-align:center;")
 			pln_layout = card_pln.content_layout()
@@ -343,7 +343,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 
 		# ---------- SEARCH AREA CARD --------
 		if 1:
-			card_roi = CollapsibleCard("SEARCH BOUNDS (above table)")
+			card_roi = CollapsibleCard("SEARCH BOUNDS (above plane)")
 			card_roi._button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 			card_roi._button.setStyleSheet(card_roi._button.styleSheet() + " text-align:center;")
 			roi_layout = card_roi.content_layout()
@@ -502,22 +502,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		self.timer.timeout.connect(self._tick)
 		self.timer.start(66)
 
-	def _set_worker(self, worker):
-		self.worker = worker
-
-	def _dspin(self, lo, hi, step, val, label):
-		box = QtWidgets.QGroupBox(label)
-		lay = QtWidgets.QHBoxLayout(box)
-		spin = QtWidgets.QDoubleSpinBox()
-		spin.setRange(lo, hi)
-		spin.setSingleStep(step)
-		spin.setDecimals(4)
-		spin.setValue(val)
-		spin.setAlignment(QtCore.Qt.AlignRight)
-		lay.addWidget(spin)
-		self.layout().itemAt(1).widget().layout().insertWidget(self.layout().itemAt(1).widget().layout().count()-1, box)
-		return spin
-
 	def _tick(self):
 		# Update cloud
 		xyz = self.worker.get_point_cloud_snapshot()
@@ -563,101 +547,121 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			R_plane_world = np.column_stack([self.plane.u, self.plane.n, self.plane.v])
 			self.glyph_plane.setRotationCam(Rw @ R_plane_world)
 
-	def _update_box(self):
-		if not self.box_visible:
-			# Hide
-			self.box_lines.setData(pos=np.empty((0,3)))
-			for axis in self.box_axes:
-				axis.setData(pos=np.empty((0,3)))
+	def _load_defaults(self):
+		#Read JSON state (if exists) and apply as current defaults
+		if not os.path.isfile(self.config_path):
 			return
+		try:
+			with open(self.config_path, "r", encoding="utf-8") as f:
+				state = json.load(f)
+			self._apply_state(state)
+			# After applying, make sure the visuals update
+			self._update_box()
+			self._update_plane_draw()
+		except Exception as e:
+			QtWidgets.QMessageBox.warning(self, "Load error", f"Could not load config:\n{e}")
+
+	def _apply_state(self, state: dict):
+		# ---- Box ----
+		box = state.get("box", {})
+		c = box.get("center")
+		e = box.get("extents")
+		ypr = box.get("ypr_deg")
+		if c:   self.cx.setValue(float(c[0])); self.cy.setValue(float(c[1])); self.cz.setValue(float(c[2]))
+		if e:   self.ex.setValue(float(e[0])); self.ey.setValue(float(e[1])); self.ez.setValue(float(e[2]))
+		if ypr: self.yaw.setValue(float(ypr[0])); self.pitch.setValue(float(ypr[1])); self.roll.setValue(float(ypr[2]))
+
+		roi = state.get("roi", {})
+		self.roi_x_extend = float(roi.get("x_extend", 0.0))
+		self.roi_z_extend = float(roi.get("z_extend", 0.0))
+		self.roi_mirror_x = bool(roi.get("mirror_x", False))
+		self.roi_mirror_z = bool(roi.get("mirror_z", False))
+		self.roi_y_min    = float(roi.get("y_min", 0.0))
+		self.roi_y_max    = float(roi.get("y_max", 0.2))
 		
-		# Build wireframe box from center/half-extents/rotation
-		c = np.array([self.cx.value(), self.cy.value(), self.cz.value()], float)
-		e = np.array([self.ex.value(), self.ey.value(), self.ez.value()], float)
-		R = self._R_yxz(self.yaw.value(), self.pitch.value(), self.roll.value())
+		self.spn_x.blockSignals(True); self.spn_x.setValue(self.roi_x_extend); self.spn_x.blockSignals(False)
+		self.spn_z.blockSignals(True); self.spn_z.setValue(self.roi_z_extend); self.spn_z.blockSignals(False)
+		self.chk_roi_mx.setChecked(self.roi_mirror_x)
+		self.chk_roi_mz.setChecked(self.roi_mirror_z)
+		self.sp_roi_ymin.setValue(self.roi_y_min)
+		self.sp_roi_ymax.setValue(self.roi_y_max)
 
-		# 8 corners in local box space (+/- ex,ey,ez)
-		corners_local = np.array([[ sx, sy, sz] for sx in (-e[0],e[0]) for sy in (-e[1],e[1]) for sz in (-e[2],e[2])])
-		corners = (corners_local @ R.T) + c
+		cp = box.get("color_points")
+		if cp is not None:
+			self.pts_visible = bool(cp)
+			self.chk_pts_visible.blockSignals(True)
+			self.chk_pts_visible.setChecked(self.pts_visible)
+			self.chk_pts_visible.blockSignals(False)
 
-		# 12 edges index pairs
-		idx = [(0,1),(0,2),(0,4),(1,3),(1,5),(2,3),(2,6),(3,7),(4,5),(4,6),(5,7),(6,7)]
-		lines = []
-		for a,b in idx:
-			lines.append(corners[a])
-			lines.append(corners[b])
-		lines = np.asarray(lines, float)
+		# ---- Plane ----
+		pl = state.get("plane")
+		if pl:
+			p0 = np.array(pl.get("p0", [0,0,0]), float)
+			n  = np.array(pl.get("normal", [0,1,0]), float); n = n/np.linalg.norm(n) if np.linalg.norm(n)>0 else n
+			u  = np.array(pl.get("u", [1,0,0]), float)
+			v  = np.array(pl.get("v", [0,0,1]), float)
+			# Rebuild base pose
+			self._pl_R_base = np.column_stack([u, n, v])
+			self._pl_p0_base = p0
 
-		self.box_lines.setData(pos=lines, color=(1,1,1,0.9))
-	
-	def _make_box_mesh(self, sx, sy, sz, color=(0.85,0.85,0.90,0.9)):
-		# axis-aligned cuboid centered at origin
-		x,y,z = sx*0.5, sy*0.5, sz*0.5
-		verts = np.array([
-			[-x,-y,-z], [ x,-y,-z], [ x, y,-z], [-x, y,-z],  # back
-			[-x,-y, z], [ x,-y, z], [ x, y, z], [-x, y, z],  # front
-		], dtype=float)
-		faces = np.array([
-			[0,1,2],[0,2,3],  # back
-			[4,5,6],[4,6,7],  # front
-			[0,1,5],[0,5,4],  # bottom
-			[2,3,7],[2,7,6],  # top
-			[1,2,6],[1,6,5],  # right
-			[0,3,7],[0,7,4],  # left
-		], dtype=int)
-		md = gl.MeshData(vertexes=verts, faces=faces)
-		m  = gl.GLMeshItem(meshdata=md, smooth=False, drawEdges=False)
-		m.setGLOptions('translucent')
-		m.setColor(color)
-		return m
+			# Local edits
+			loff = pl.get("local_offsets", [0,0,0])
+			self._pl_off_local = np.array(loff, float)
+			lypr = pl.get("local_yaw_pitch_roll_deg", [0,0,0])
+			self._pl_yaw, self._pl_pitch, self._pl_roll = [float(a) for a in lypr]
 
-	def _suggest_orientation(self):
+			# Size & visibility
+			self.pl_size_x = float(pl.get("width_m", 0.70))
+			self.pl_size_z = float(pl.get("length_m", 0.70))
+			
+			self.sp_lx.setValue(self._pl_off_local[0])
+			self.sp_ly.setValue(self._pl_off_local[1])
+			self.sp_lz.setValue(self._pl_off_local[2])
+			self.sp_yw2.setValue(self._pl_yaw)
+			self.sp_pt2.setValue(self._pl_pitch)
+			self.sp_rl2.setValue(self._pl_roll)
 
-		xyz = self.worker.get_point_cloud_snapshot()
-		if xyz is None or xyz.shape[0] < 100:
-			QtWidgets.QMessageBox.information(self, "Suggest", "Not enough points.")
-			return
+			# Populate UI controls to reflect size/visibility/local edits
+			self.sp_plane_w.blockSignals(True); self.sp_plane_w.setValue(self.pl_size_x); self.sp_plane_w.blockSignals(False)
+			self.sp_plane_l.blockSignals(True); self.sp_plane_l.setValue(self.pl_size_z); self.sp_plane_l.blockSignals(False)
+			self.chk_plane_visible.blockSignals(True); self.chk_plane_visible.setChecked(self.pl_visible); self.chk_plane_visible.blockSignals(False)
+			self.sp_cx.blockSignals(True); self.sp_cx.setValue(self.cx.value()); self.sp_cx.blockSignals(False)
+			self.sp_cy.blockSignals(True); self.sp_cy.setValue(self.cy.value()); self.sp_cy.blockSignals(False)
+			self.sp_cz.blockSignals(True); self.sp_cz.setValue(self.cz.value()); self.sp_cz.blockSignals(False)
+			self.sp_yw.blockSignals(True); self.sp_yw.setValue(self.yaw.value()); self.sp_yw.blockSignals(False)
+			self.sp_pt.blockSignals(True); self.sp_pt.setValue(self.pitch.value()); self.sp_pt.blockSignals(False)
+			self.sp_rl.blockSignals(True); self.sp_rl.setValue(self.roll.value()); self.sp_rl.blockSignals(False)
 
-		# Current box center and half-extents
-		cx, cy, cz = float(self.cx.value()), float(self.cy.value()), float(self.cz.value())
-		ex, ey, ez = float(self.ex.value()), float(self.ey.value()), float(self.ez.value())
+			# Create/refresh plane object and draw
+			R = self._plane_R_from_base_and_loc()
+			p0c = self._plane_p0_from_base_and_loc()
+			u_cur, n_cur, v_cur = R[:,0], R[:,1], R[:,2]
+			self.plane = TablePlane(n=n_cur/np.linalg.norm(n_cur), d=-(n_cur @ p0c), p0=p0c, u=u_cur/np.linalg.norm(u_cur), v=v_cur/np.linalg.norm(v_cur))
+			self._update_plane_draw()
+			self._update_global_axes()
 
-		# Select a neighborhood: rectangle in XZ around the center (slightly larger than box)
-		tol = 1.15  # 15% margin
-		m = (np.abs(xyz[:,0] - cx) <= ex * tol) & (np.abs(xyz[:,2] - cz) <= ez * tol)
-		pts = xyz[m]
-		if pts.shape[0] < 200:
-			# If too sparse, relax once
-			tol = 1.5
-			m = (np.abs(xyz[:,0] - cx) <= ex * tol) & (np.abs(xyz[:,2] - cz) <= ez * tol)
-			pts = xyz[m]
-		if pts.shape[0] < 100:
-			QtWidgets.QMessageBox.information(self, "Suggest", "Not enough local points near the box.")
-			return
+		# ---- Camera ----
+		self._set_default_view()
 
-		# Downsample if huge (speed)
-		if pts.shape[0] > 80000:
-			step = int(np.ceil(pts.shape[0] / 80000.0))
-			pts = pts[::step]
+		# ---- Flags ----
+		fl = state.get("flags", {})
+		if "plane_visible" in fl:
+			self.pl_visible = bool(fl["plane_visible"])
+			self.chk_plane_visible.blockSignals(True)
+			self.chk_plane_visible.setChecked(self.pl_visible)
+			self.chk_plane_visible.blockSignals(False)
+		
+		if "box_visible" in fl:
+			self.box_visible = bool(fl["box_visible"])
+			self.chk_box_visible.blockSignals(True)
+			self.chk_box_visible.setChecked(self.box_visible)
+			self.chk_box_visible.blockSignals(False)
 
-		# Fit plane
-		n, d, c_local, rms = _fit_plane_svd(pts)
-
-		Rprev = _RzRyRx(self.yaw.value(), self.pitch.value(), self.roll.value())
-		xprev = Rprev[:, 0]
-		R = _R_from_n_and_u(n, xprev)   # columns are world directions of local x,y,z
-		# Sanity: R[:,1] (the 'y' column) is the plane normal
-		# assert np.allclose(R[:,1] / np.linalg.norm(R[:,1]), n, atol=1e-6)
-
-		yaw, pitch, roll = self._euler_from_R_yxz(R)
-
-		self.yaw.setValue(float(yaw))
-		self.pitch.setValue(float(pitch))
-		self.roll.setValue(float(roll))
-
-		# Optional: micro feedback
-		QtWidgets.QToolTip.showText(self.mapToGlobal(QtCore.QPoint(0,0)),
-									f"Plane fit RMS: {rms*1000:.1f} mm on {pts.shape[0]} pts")
+		if "roi_visible" in fl:
+			self.roi_visible = bool(fl["roi_visible"])
+			self.chk_roi_visible.blockSignals(True)
+			self.chk_roi_visible.setChecked(self.roi_visible)
+			self.chk_roi_visible.blockSignals(False)
 
 	def _state_to_dict(self):
 		"""Collect full UI state (box, plane, camera, flags) -> dict."""
@@ -721,155 +725,11 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self._pick_and_center(pos.x(), pos.y())
 			return True
 		return super().eventFilter(obj, ev)
-	
-	def _make_axis(self, origin, direction, color, width=2.0):
-		p = np.array([origin, origin + direction], dtype=float)
-		item = gl.GLLinePlotItem(pos=p, color=color, width=width, mode='lines')
-		self.gl.addItem(item)
-		return item
-	
-	def _global_axis_origin(self):
-		"""Axis anchored at the table's physical center: base p0 + (dx*u + dz*v), ignoring local Y offset."""
-		if self.plane is None:
-			return np.zeros(3), np.eye(3)
-		# current [u n v] and local offsets
-		R = self._plane_R_from_base_and_loc()
-		u, n, v = R[:,0], R[:,1], R[:,2]
-		off = self._pl_off_local
-		# ignore local Y offset (normal)
-		origin = self._pl_p0_base + off[0]*u + off[2]*v
-		return origin, R
 
-	def _fade_line(self, origin, direction, half_len, color_rgb, steps=21):
-		"""Returns (pos, rgba) for a long line with end-fade."""
-		t = np.linspace(-half_len, half_len, steps)
-		pos = origin[None,:] + t[:,None]*direction[None,:]
-		# alpha tapered toward ends; keep thin lines darker outwards
-		a = 0.90 * (1.0 - (np.abs(t)/half_len)*0.75)
-		r,g,b = color_rgb
-		rgba = np.column_stack([np.full_like(a, r), np.full_like(a, g), np.full_like(a, b), a])
-		return pos.astype(np.float32), rgba.astype(np.float32)
+	def _set_worker(self, worker):
+		self.worker = worker
 
-	def _update_global_axes(self):
-		if (self.plane is None) or (not self.pl_visible):
-			for it in (self.global_axis_x, self.global_axis_y, self.global_axis_z):
-				it.setData(pos=np.empty((0,3)))
-			return
-		O, R = self._global_axis_origin()
-		u, n, v = R[:,0]/(np.linalg.norm(R[:,0])+1e-12), R[:,1]/(np.linalg.norm(R[:,1])+1e-12), R[:,2]/(np.linalg.norm(R[:,2])+1e-12)
-		# very long axes (meters)
-		L = 2.5
-		px, cx = self._fade_line(O, u, L, (1.0, 0.15, 0.15))
-		py, cy = self._fade_line(O, n, L, (0.2, 0.95, 0.2))
-		pz, cz = self._fade_line(O, v, L, (0.2, 0.5, 1.0))
-		self.global_axis_x.setData(pos=px, color=cx)
-		self.global_axis_y.setData(pos=py, color=cy)
-		self.global_axis_z.setData(pos=pz, color=cz)
-
-	def _pick_and_center(self, px, py):
-		xyz = self.worker.get_point_cloud_snapshot()
-		if xyz is None or xyz.shape[0] == 0:
-			return
-
-		scr = self._project_points(xyz)
-		if scr is None:
-			return
-		j = int(np.nanargmin((scr[:,0]-px)**2 + (scr[:,1]-py)**2))
-		p = xyz[j]  # already in scene coords
-		self.cx.setValue(float(p[0]))
-		self.cy.setValue(float(p[1]))
-		self.cz.setValue(float(p[2]))
-
-	def _project_points(self, pts):
-		try:
-			PM = np.array(self.gl.projectionMatrix().data()).reshape(4,4).T
-			VM = np.array(self.gl.viewMatrix().data()).reshape(4,4).T
-		except Exception:
-			return None
-
-		pts_vis = np.asarray(pts, dtype=float)
-		if getattr(self, "_visual_flip_y", False):
-			pts_vis = pts_vis.copy()
-			pts_vis[:, 1] *= -1.0
-
-		P = PM @ VM
-		N = pts_vis.shape[0]
-		hom = np.c_[pts_vis, np.ones((N,1))]
-		clip = hom @ P.T
-		w = clip[:, 3:4]
-		ok = np.abs(w[:, 0]) > 1e-9
-		clip = clip[ok]; w = w[ok]
-		ndc = clip[:, :3] / w  # [-1,1]
-
-		W = float(self.gl.width())
-		H = float(self.gl.height())
-		x_px = (ndc[:, 0] * 0.5 + 0.5) * W
-		y_px = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * H  # Qt y down
-
-		out = np.empty((N, 2), dtype=float)
-		out[:] = np.nan
-		out[ok, 0] = x_px
-		out[ok, 1] = y_px
-		return out
-	
-	def _R_yxz(self, yaw_deg, pitch_deg, roll_deg):
-		y, p, r = np.deg2rad([yaw_deg, pitch_deg, roll_deg])
-		return _Ry(y) @ _Rx(p) @ _Rz(r)
-	
-	def _euler_from_R_yxz(self, R):
-		pitch = -np.degrees(np.arcsin(R[1,2]))
-		yaw   =  np.degrees(np.arctan2(R[0,2], R[2,2]))
-		roll  =  np.degrees(np.arctan2(R[1,0], R[1,1]))
-		return _wrap_deg(yaw), _wrap_deg(pitch), _wrap_deg(roll)
-	
-	def _view_from_axis(self, dir):
-	
-		if self.plane is None:
-			return
-		
-		self.current_view += dir
-		if self.current_view < 0: self.current_view = 3
-		elif self.current_view > 3: self.current_view = 0
-		
-		if self.current_view % 2: which = 'v'
-		if not self.current_view % 2: which = 'u'
-		if self.current_view < 2: sign = 1
-		if self.current_view >= 2: sign = -1
-
-		# table centre, ignoring local Y offset
-		O, Rw = self._global_axis_origin()
-		u, n, v = Rw[:,0], Rw[:,1], Rw[:,2]
-
-		# choose direction
-		dir_vec = (u if which == 'u' else v) * float(sign)
-		dir_vec = dir_vec / (np.linalg.norm(dir_vec) + 1e-12)
-
-		# camera placement: back away along dir, lift slightly along n
-		back = 2.0 
-		lift = 0.35
-		center = np.asarray(O, dtype=float)
-		eye = center - dir_vec * back + n * lift
-
-		# center
-		self.gl.opts['center'] = pg.Vector(float(center[0]), float(center[1]), float(center[2]))
-
-		# azimuth from ±U/±V projection on XZ
-		az = math.degrees(math.atan2(dir_vec[0], dir_vec[2]))
-		elev = 15.0  # modest tilt
-
-		dist = float(np.linalg.norm(eye - center))
-		self.gl.setCameraPosition(distance=dist, elevation=float(elev), azimuth=float(az))
-
-	def _set_default_view(self):
-		center_z = 1.0
-		center = pg.Vector(0.0, 0.0, center_z)
-
-		self.gl.opts['center'] = center
-
-		# Distance from the center, elevation (deg above XZ), azimuth (deg around Y)
-		self.gl.setCameraPosition(distance=2, elevation=-80, azimuth=90)
-		self.gl.orbit(0, 0)
-	
+#============== Plane Functions =========================	
 	def _plane_R_from_base_and_loc(self):
 		"""Compute [u n v] from base pose + local yaw/pitch/roll, no self.plane dependency."""
 		y, p, r = np.deg2rad([self._pl_yaw, self._pl_pitch, self._pl_roll])
@@ -990,123 +850,191 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 
 		QtWidgets.QToolTip.showText(self.mapToGlobal(QtCore.QPoint(0,0)),
 									f"Plane RMS: {rms*1000:.1f} mm on {pts.shape[0]} pts")
-		
-	def _load_defaults(self):
-		#Read JSON state (if exists) and apply as current defaults
-		if not os.path.isfile(self.config_path):
+
+	def _global_axis_origin(self):
+		"""Axis anchored at the table's physical center: base p0 + (dx*u + dz*v), ignoring local Y offset."""
+		if self.plane is None:
+			return np.zeros(3), np.eye(3)
+		# current [u n v] and local offsets
+		R = self._plane_R_from_base_and_loc()
+		u, n, v = R[:,0], R[:,1], R[:,2]
+		off = self._pl_off_local
+		# ignore local Y offset (normal)
+		origin = self._pl_p0_base + off[0]*u + off[2]*v
+		return origin, R
+
+	def _update_global_axes(self):
+		if (self.plane is None) or (not self.pl_visible):
+			for it in (self.global_axis_x, self.global_axis_y, self.global_axis_z):
+				it.setData(pos=np.empty((0,3)))
 			return
+		O, R = self._global_axis_origin()
+		u, n, v = R[:,0]/(np.linalg.norm(R[:,0])+1e-12), R[:,1]/(np.linalg.norm(R[:,1])+1e-12), R[:,2]/(np.linalg.norm(R[:,2])+1e-12)
+		# very long axes (meters)
+		L = 2.5
+		px, cx = self._fade_line(O, u, L, (1.0, 0.15, 0.15))
+		py, cy = self._fade_line(O, n, L, (0.2, 0.95, 0.2))
+		pz, cz = self._fade_line(O, v, L, (0.2, 0.5, 1.0))
+		self.global_axis_x.setData(pos=px, color=cx)
+		self.global_axis_y.setData(pos=py, color=cy)
+		self.global_axis_z.setData(pos=pz, color=cz)
+
+	def _project_points(self, pts):
 		try:
-			with open(self.config_path, "r", encoding="utf-8") as f:
-				state = json.load(f)
-			self._apply_state(state)
-			# After applying, make sure the visuals update
-			self._update_box()
-			self._update_plane_draw()
-		except Exception as e:
-			QtWidgets.QMessageBox.warning(self, "Load error", f"Could not load config:\n{e}")
+			PM = np.array(self.gl.projectionMatrix().data()).reshape(4,4).T
+			VM = np.array(self.gl.viewMatrix().data()).reshape(4,4).T
+		except Exception:
+			return None
 
-	def _apply_state(self, state: dict):
-		# ---- Box ----
-		box = state.get("box", {})
-		c = box.get("center")
-		e = box.get("extents")
-		ypr = box.get("ypr_deg")
-		if c:   self.cx.setValue(float(c[0])); self.cy.setValue(float(c[1])); self.cz.setValue(float(c[2]))
-		if e:   self.ex.setValue(float(e[0])); self.ey.setValue(float(e[1])); self.ez.setValue(float(e[2]))
-		if ypr: self.yaw.setValue(float(ypr[0])); self.pitch.setValue(float(ypr[1])); self.roll.setValue(float(ypr[2]))
+		pts_vis = np.asarray(pts, dtype=float)
+		if getattr(self, "_visual_flip_y", False):
+			pts_vis = pts_vis.copy()
+			pts_vis[:, 1] *= -1.0
 
-		roi = state.get("roi", {})
-		self.roi_x_extend = float(roi.get("x_extend", 0.0))
-		self.roi_z_extend = float(roi.get("z_extend", 0.0))
-		self.roi_mirror_x = bool(roi.get("mirror_x", False))
-		self.roi_mirror_z = bool(roi.get("mirror_z", False))
-		self.roi_y_min    = float(roi.get("y_min", 0.0))
-		self.roi_y_max    = float(roi.get("y_max", 0.2))
-		
-		self.spn_x.blockSignals(True); self.spn_x.setValue(self.roi_x_extend); self.spn_x.blockSignals(False)
-		self.spn_z.blockSignals(True); self.spn_z.setValue(self.roi_z_extend); self.spn_z.blockSignals(False)
-		self.chk_roi_mx.setChecked(self.roi_mirror_x)
-		self.chk_roi_mz.setChecked(self.roi_mirror_z)
-		self.sp_roi_ymin.setValue(self.roi_y_min)
-		self.sp_roi_ymax.setValue(self.roi_y_max)
+		P = PM @ VM
+		N = pts_vis.shape[0]
+		hom = np.c_[pts_vis, np.ones((N,1))]
+		clip = hom @ P.T
+		w = clip[:, 3:4]
+		ok = np.abs(w[:, 0]) > 1e-9
+		clip = clip[ok]; w = w[ok]
+		ndc = clip[:, :3] / w  # [-1,1]
 
-		cp = box.get("color_points")
-		if cp is not None:
-			self.pts_visible = bool(cp)
-			self.chk_pts_visible.blockSignals(True)
-			self.chk_pts_visible.setChecked(self.pts_visible)
-			self.chk_pts_visible.blockSignals(False)
+		W = float(self.gl.width())
+		H = float(self.gl.height())
+		x_px = (ndc[:, 0] * 0.5 + 0.5) * W
+		y_px = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * H  # Qt y down
 
-		# ---- Plane ----
-		pl = state.get("plane")
-		if pl:
-			p0 = np.array(pl.get("p0", [0,0,0]), float)
-			n  = np.array(pl.get("normal", [0,1,0]), float); n = n/np.linalg.norm(n) if np.linalg.norm(n)>0 else n
-			u  = np.array(pl.get("u", [1,0,0]), float)
-			v  = np.array(pl.get("v", [0,0,1]), float)
-			# Rebuild base pose
-			self._pl_R_base = np.column_stack([u, n, v])
-			self._pl_p0_base = p0
-
-			# Local edits
-			loff = pl.get("local_offsets", [0,0,0])
-			self._pl_off_local = np.array(loff, float)
-			lypr = pl.get("local_yaw_pitch_roll_deg", [0,0,0])
-			self._pl_yaw, self._pl_pitch, self._pl_roll = [float(a) for a in lypr]
-
-			# Size & visibility
-			self.pl_size_x = float(pl.get("width_m", 0.70))
-			self.pl_size_z = float(pl.get("length_m", 0.70))
-			
-			self.sp_lx.setValue(self._pl_off_local[0])
-			self.sp_ly.setValue(self._pl_off_local[1])
-			self.sp_lz.setValue(self._pl_off_local[2])
-			self.sp_yw2.setValue(self._pl_yaw)
-			self.sp_pt2.setValue(self._pl_pitch)
-			self.sp_rl2.setValue(self._pl_roll)
-
-			# Populate UI controls to reflect size/visibility/local edits
-			self.sp_plane_w.blockSignals(True); self.sp_plane_w.setValue(self.pl_size_x); self.sp_plane_w.blockSignals(False)
-			self.sp_plane_l.blockSignals(True); self.sp_plane_l.setValue(self.pl_size_z); self.sp_plane_l.blockSignals(False)
-			self.chk_plane_visible.blockSignals(True); self.chk_plane_visible.setChecked(self.pl_visible); self.chk_plane_visible.blockSignals(False)
-			self.sp_cx.blockSignals(True); self.sp_cx.setValue(self.cx.value()); self.sp_cx.blockSignals(False)
-			self.sp_cy.blockSignals(True); self.sp_cy.setValue(self.cy.value()); self.sp_cy.blockSignals(False)
-			self.sp_cz.blockSignals(True); self.sp_cz.setValue(self.cz.value()); self.sp_cz.blockSignals(False)
-			self.sp_yw.blockSignals(True); self.sp_yw.setValue(self.yaw.value()); self.sp_yw.blockSignals(False)
-			self.sp_pt.blockSignals(True); self.sp_pt.setValue(self.pitch.value()); self.sp_pt.blockSignals(False)
-			self.sp_rl.blockSignals(True); self.sp_rl.setValue(self.roll.value()); self.sp_rl.blockSignals(False)
-
-			# Create/refresh plane object and draw
-			R = self._plane_R_from_base_and_loc()
-			p0c = self._plane_p0_from_base_and_loc()
-			u_cur, n_cur, v_cur = R[:,0], R[:,1], R[:,2]
-			self.plane = TablePlane(n=n_cur/np.linalg.norm(n_cur), d=-(n_cur @ p0c), p0=p0c, u=u_cur/np.linalg.norm(u_cur), v=v_cur/np.linalg.norm(v_cur))
-			self._update_plane_draw()
-			self._update_global_axes()
-
-		# ---- Camera ----
-		self._set_default_view()
-
-		# ---- Flags ----
-		fl = state.get("flags", {})
-		if "plane_visible" in fl:
-			self.pl_visible = bool(fl["plane_visible"])
-			self.chk_plane_visible.blockSignals(True)
-			self.chk_plane_visible.setChecked(self.pl_visible)
-			self.chk_plane_visible.blockSignals(False)
-		
-		if "box_visible" in fl:
-			self.box_visible = bool(fl["box_visible"])
-			self.chk_box_visible.blockSignals(True)
-			self.chk_box_visible.setChecked(self.box_visible)
-			self.chk_box_visible.blockSignals(False)
-
-		if "roi_visible" in fl:
-			self.roi_visible = bool(fl["roi_visible"])
-			self.chk_roi_visible.blockSignals(True)
-			self.chk_roi_visible.setChecked(self.roi_visible)
-			self.chk_roi_visible.blockSignals(False)
+		out = np.empty((N, 2), dtype=float)
+		out[:] = np.nan
+		out[ok, 0] = x_px
+		out[ok, 1] = y_px
+		return out
 	
+	def _R_yxz(self, yaw_deg, pitch_deg, roll_deg):
+		y, p, r = np.deg2rad([yaw_deg, pitch_deg, roll_deg])
+		return _Ry(y) @ _Rx(p) @ _Rz(r)
+	
+	def _euler_from_R_yxz(self, R):
+		pitch = -np.degrees(np.arcsin(R[1,2]))
+		yaw   =  np.degrees(np.arctan2(R[0,2], R[2,2]))
+		roll  =  np.degrees(np.arctan2(R[1,0], R[1,1]))
+		return _wrap_deg(yaw), _wrap_deg(pitch), _wrap_deg(roll)
+#=========================================================		
+	
+#================= Box Functions =========================
+	def _update_box(self):
+		if not self.box_visible:
+			# Hide
+			self.box_lines.setData(pos=np.empty((0,3)))
+			for axis in self.box_axes:
+				axis.setData(pos=np.empty((0,3)))
+			return
+		
+		# Build wireframe box from center/half-extents/rotation
+		c = np.array([self.cx.value(), self.cy.value(), self.cz.value()], float)
+		e = np.array([self.ex.value(), self.ey.value(), self.ez.value()], float)
+		R = self._R_yxz(self.yaw.value(), self.pitch.value(), self.roll.value())
+
+		# 8 corners in local box space (+/- ex,ey,ez)
+		corners_local = np.array([[ sx, sy, sz] for sx in (-e[0],e[0]) for sy in (-e[1],e[1]) for sz in (-e[2],e[2])])
+		corners = (corners_local @ R.T) + c
+
+		# 12 edges index pairs
+		idx = [(0,1),(0,2),(0,4),(1,3),(1,5),(2,3),(2,6),(3,7),(4,5),(4,6),(5,7),(6,7)]
+		lines = []
+		for a,b in idx:
+			lines.append(corners[a])
+			lines.append(corners[b])
+		lines = np.asarray(lines, float)
+
+		self.box_lines.setData(pos=lines, color=(1,1,1,0.9))
+	
+	def _make_box_mesh(self, sx, sy, sz, color=(0.85,0.85,0.90,0.9)):
+		# axis-aligned cuboid centered at origin
+		x,y,z = sx*0.5, sy*0.5, sz*0.5
+		verts = np.array([
+			[-x,-y,-z], [ x,-y,-z], [ x, y,-z], [-x, y,-z],  # back
+			[-x,-y, z], [ x,-y, z], [ x, y, z], [-x, y, z],  # front
+		], dtype=float)
+		faces = np.array([
+			[0,1,2],[0,2,3],  # back
+			[4,5,6],[4,6,7],  # front
+			[0,1,5],[0,5,4],  # bottom
+			[2,3,7],[2,7,6],  # top
+			[1,2,6],[1,6,5],  # right
+			[0,3,7],[0,7,4],  # left
+		], dtype=int)
+		md = gl.MeshData(vertexes=verts, faces=faces)
+		m  = gl.GLMeshItem(meshdata=md, smooth=False, drawEdges=False)
+		m.setGLOptions('translucent')
+		m.setColor(color)
+		return m
+
+	def _pick_and_center(self, px, py):
+		xyz = self.worker.get_point_cloud_snapshot()
+		if xyz is None or xyz.shape[0] == 0:
+			return
+
+		scr = self._project_points(xyz)
+		if scr is None:
+			return
+		j = int(np.nanargmin((scr[:,0]-px)**2 + (scr[:,1]-py)**2))
+		p = xyz[j]  # already in scene coords
+		self.cx.setValue(float(p[0]))
+		self.cy.setValue(float(p[1]))
+		self.cz.setValue(float(p[2]))
+
+	def _suggest_orientation(self):
+
+		xyz = self.worker.get_point_cloud_snapshot()
+		if xyz is None or xyz.shape[0] < 100:
+			QtWidgets.QMessageBox.information(self, "Suggest", "Not enough points.")
+			return
+
+		# Current box center and half-extents
+		cx, cy, cz = float(self.cx.value()), float(self.cy.value()), float(self.cz.value())
+		ex, ey, ez = float(self.ex.value()), float(self.ey.value()), float(self.ez.value())
+
+		# Select a neighborhood: rectangle in XZ around the center (slightly larger than box)
+		tol = 1.15  # 15% margin
+		m = (np.abs(xyz[:,0] - cx) <= ex * tol) & (np.abs(xyz[:,2] - cz) <= ez * tol)
+		pts = xyz[m]
+		if pts.shape[0] < 200:
+			# If too sparse, relax once
+			tol = 1.5
+			m = (np.abs(xyz[:,0] - cx) <= ex * tol) & (np.abs(xyz[:,2] - cz) <= ez * tol)
+			pts = xyz[m]
+		if pts.shape[0] < 100:
+			QtWidgets.QMessageBox.information(self, "Suggest", "Not enough local points near the box.")
+			return
+
+		# Downsample if huge (speed)
+		if pts.shape[0] > 80000:
+			step = int(np.ceil(pts.shape[0] / 80000.0))
+			pts = pts[::step]
+
+		# Fit plane
+		n, d, c_local, rms = _fit_plane_svd(pts)
+
+		Rprev = _RzRyRx(self.yaw.value(), self.pitch.value(), self.roll.value())
+		xprev = Rprev[:, 0]
+		R = _R_from_n_and_u(n, xprev)   # columns are world directions of local x,y,z
+		# Sanity: R[:,1] (the 'y' column) is the plane normal
+		# assert np.allclose(R[:,1] / np.linalg.norm(R[:,1]), n, atol=1e-6)
+
+		yaw, pitch, roll = self._euler_from_R_yxz(R)
+
+		self.yaw.setValue(float(yaw))
+		self.pitch.setValue(float(pitch))
+		self.roll.setValue(float(roll))
+
+		# Optional: micro feedback
+		QtWidgets.QToolTip.showText(self.mapToGlobal(QtCore.QPoint(0,0)),
+									f"Plane fit RMS: {rms*1000:.1f} mm on {pts.shape[0]} pts")
+#=========================================================
+
+#================= ROI Functions =========================
 	def _roi_corners_ext(self, p0, u, v, n, w, l, y0, y1):
 		# same logic as main UI: mirror vs single-side, using self.roi_* values
 		hx, hz = 0.5*w, 0.5*l
@@ -1157,6 +1085,86 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		for i,j in E:
 			lines.append(V[i]); lines.append(V[j])
 		self.roi_edges.setData(pos=np.asarray(lines, float), color=(0.85,0.85,0.85,0.9))
+#=========================================================
+
+#================ Graphics ===============================
+	def _view_from_axis(self, dir):
+	
+		if self.plane is None:
+			return
+		
+		self.current_view += dir
+		if self.current_view < 0: self.current_view = 3
+		elif self.current_view > 3: self.current_view = 0
+		
+		if self.current_view % 2: which = 'v'
+		if not self.current_view % 2: which = 'u'
+		if self.current_view < 2: sign = 1
+		if self.current_view >= 2: sign = -1
+
+		# table centre, ignoring local Y offset
+		O, Rw = self._global_axis_origin()
+		u, n, v = Rw[:,0], Rw[:,1], Rw[:,2]
+
+		# choose direction
+		dir_vec = (u if which == 'u' else v) * float(sign)
+		dir_vec = dir_vec / (np.linalg.norm(dir_vec) + 1e-12)
+
+		# camera placement: back away along dir, lift slightly along n
+		back = 2.0 
+		lift = 0.35
+		center = np.asarray(O, dtype=float)
+		eye = center - dir_vec * back + n * lift
+
+		# center
+		self.gl.opts['center'] = pg.Vector(float(center[0]), float(center[1]), float(center[2]))
+
+		# azimuth from ±U/±V projection on XZ
+		az = math.degrees(math.atan2(dir_vec[0], dir_vec[2]))
+		elev = 15.0  # modest tilt
+
+		dist = float(np.linalg.norm(eye - center))
+		self.gl.setCameraPosition(distance=dist, elevation=float(elev), azimuth=float(az))
+
+	def _set_default_view(self):
+		center_z = 1.0
+		center = pg.Vector(0.0, 0.0, center_z)
+
+		self.gl.opts['center'] = center
+
+		# Distance from the center, elevation (deg above XZ), azimuth (deg around Y)
+		self.gl.setCameraPosition(distance=2, elevation=-80, azimuth=90)
+		self.gl.orbit(0, 0)
+
+	def _dspin(self, lo, hi, step, val, label):
+		box = QtWidgets.QGroupBox(label)
+		lay = QtWidgets.QHBoxLayout(box)
+		spin = QtWidgets.QDoubleSpinBox()
+		spin.setRange(lo, hi)
+		spin.setSingleStep(step)
+		spin.setDecimals(4)
+		spin.setValue(val)
+		spin.setAlignment(QtCore.Qt.AlignRight)
+		lay.addWidget(spin)
+		self.layout().itemAt(1).widget().layout().insertWidget(self.layout().itemAt(1).widget().layout().count()-1, box)
+		return spin
+	
+	def _fade_line(self, origin, direction, half_len, color_rgb, steps=21):
+		"""Returns (pos, rgba) for a long line with end-fade."""
+		t = np.linspace(-half_len, half_len, steps)
+		pos = origin[None,:] + t[:,None]*direction[None,:]
+		# alpha tapered toward ends; keep thin lines darker outwards
+		a = 0.90 * (1.0 - (np.abs(t)/half_len)*0.75)
+		r,g,b = color_rgb
+		rgba = np.column_stack([np.full_like(a, r), np.full_like(a, g), np.full_like(a, b), a])
+		return pos.astype(np.float32), rgba.astype(np.float32)
+
+	def _make_axis(self, origin, direction, color, width=2.0):
+		p = np.array([origin, origin + direction], dtype=float)
+		item = gl.GLLinePlotItem(pos=p, color=color, width=width, mode='lines')
+		self.gl.addItem(item)
+		return item
+#=================================================================
 
 
 def _fit_plane_svd(pts: np.ndarray):

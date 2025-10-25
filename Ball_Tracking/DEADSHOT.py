@@ -1252,7 +1252,7 @@ class CameraWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
 	def __init__(self):
 		super().__init__()
-		self.setWindowTitle("DEADSHOT – Ball Tracker")
+		self.setWindowTitle("DEADSHOT - Ball Tracker")
 		if os.path.exists(B_LOGO_PATH):
 			self.setWindowIcon(QtGui.QIcon(B_LOGO_PATH))
 
