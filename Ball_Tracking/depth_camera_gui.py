@@ -23,9 +23,6 @@ except Exception as e:
 	ControlListener = None
 	InterceptPublisher = None
 
-B_LOGO_PATH  = "Assets/BULLSEYE.png"
-W_LOGO_PATH  = "Assets/BULLSEYE_W.png"
-
 # =========================== CONFIG ===========================
 SEND_TO_ARDUINO_DEFAULT = False
 SERIAL_PORT = "COM6"
@@ -61,6 +58,11 @@ GATE_ALPHA = 0.99
 
 # IPC rate limit
 IPC_MIN_PERIOD_S = 1.0 / 30.0
+
+B_LOGO_PATH  = "Assets/BULLSEYE.png"
+W_LOGO_PATH  = "Assets/BULLSEYE_W.png"
+FAST_IM = "Assets/FAST_MODE.png"
+SEARCH_IM = "Assets/SEARCHING.png"
 # ============================================================
 
 
@@ -127,7 +129,8 @@ class EKF3DDrag:
 		S = H @ self.P @ H.T + R
 		if gate_alpha is not None:
 			try:
-				d2 = float(y.reshape(1,3) @ np.linalg.solve(S, y.reshape(3,1)))
+				S_inv_y = np.linalg.solve(S, y.reshape(3,1))
+				d2 = (y.reshape(1,3) @ S_inv_y).item()
 			except np.linalg.LinAlgError:
 				d2 = float("inf")
 			# rough chisq thresholds for 3 dof
@@ -403,6 +406,7 @@ class CameraWorker(QtCore.QThread):
 	status = QtCore.pyqtSignal(str)             # status line
 	event = QtCore.pyqtSignal(str)              # log events
 	camera_ok = QtCore.pyqtSignal(bool)         # camera connection
+	fast_ok = QtCore.pyqtSignal(bool)         	# fast connection
 
 	def __init__(self, parent=None):
 		super().__init__(parent)
@@ -443,6 +447,11 @@ class CameraWorker(QtCore.QThread):
 		self._cloud_every = 3
 		self._cloud_counter = 0
 		self.pc = None
+		self.enable_pointcloud = False
+
+		self.plane_overlay = None   # dict with keys: p0,u,v,width_m,length_m,visible,invert_y
+		self.plane_n = np.array(PLANE_NORMAL, float).reshape(3)
+		self.plane_d = float(PLANE_D)
 
 		# IPC / authority
 		self.ctrl = ControlListener() if ControlListener else None
@@ -471,6 +480,8 @@ class CameraWorker(QtCore.QThread):
 		# Review
 		self.review = None
 
+		self.SEARCH_CARD = cv2.imread(SEARCH_IM)
+
 	# ---------- Public setters from UI ----------
 	def set_view_mode(self, mode: str):
 		self.view_mode = mode
@@ -488,13 +499,20 @@ class CameraWorker(QtCore.QThread):
 	def set_crop(self, top, bottom, left, right):
 		self.crop_top, self.crop_bottom = float(top), float(bottom)
 		self.crop_left, self.crop_right = float(left), float(right)
+	
+	def _valid_frame(self, f):
+		return (f is not None) and getattr(f, "is_frame", lambda: False)()
+
+	def _as_np(self, f):
+		return np.asanyarray(f.get_data()) if self._valid_frame(f) else None
+
 
 	# ---------- RealSense init ----------
 	def _open_camera(self, want_depth: bool, want_rgb: bool):
-		# Choose FPS combos RealSense
-		# - depth only: 640x480@90
-		# - depth+rgb: depth@30 + rgb@60
-		# - rgb only:   rgb@60
+		if not self._device_present():
+			self.event.emit("No RealSense device detected.")
+			return False
+		
 		try:
 			self.pipeline = rs.pipeline()
 			cfg = rs.config()
@@ -510,7 +528,7 @@ class CameraWorker(QtCore.QThread):
 				cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
 				self.has_rgb = True
 			else:
-				# nothing requested → run in fast mode (no camera)
+				# nothing requested
 				return False
 
 			profile = self.pipeline.start(cfg)
@@ -531,7 +549,7 @@ class CameraWorker(QtCore.QThread):
 			except Exception:
 				self.intrinsics = None
 
-			self.pc = rs.pointcloud() if want_depth else None
+			self.pc = rs.pointcloud() if (want_depth and self.enable_pointcloud) else None
 
 			# (Re)build ReviewCapture with current scale/intrinsics
 			self.review = ReviewCapture(
@@ -594,9 +612,14 @@ class CameraWorker(QtCore.QThread):
 	# ---------- Request reconfiguration ----------
 	@QtCore.pyqtSlot(bool, bool, bool)
 	def request_reconfig(self, want_depth: bool, want_rgb: bool, fast_mode: bool):
-		self.req_depth = bool(want_depth)
-		self.req_rgb   = bool(want_rgb)
-		self.req_fast  = bool(fast_mode)
+		if fast_mode:
+			self.req_fast = True
+			self.req_depth = True
+			self.req_rgb = False
+		else:
+			self.req_fast = False
+			self.req_depth = bool(want_depth)
+			self.req_rgb   = bool(want_rgb)
 		self._reconfig_requested = True
 
 	# ---------- Detection helpers ----------
@@ -661,7 +684,7 @@ class CameraWorker(QtCore.QThread):
 	def run(self):
 		# initial open based on defaults
 		ok = False
-		if not self.req_fast:
+		if not self.req_fast and self._device_present():
 			ok = self._open_camera(self.req_depth, self.req_rgb)
 		self.camera_ok.emit(ok)
 
@@ -669,74 +692,67 @@ class CameraWorker(QtCore.QThread):
 			# Handle reconfig request
 			if self._reconfig_requested:
 				self._reconfig_requested = False
-
-				# stop any current capture
 				try:
 					if self.enable_record and self.review and self.review.active:
 						self.review.stop_and_render()
 				except Exception:
 					pass
-
-				# close camera if open
-				try:
-					if self.pipeline: self._close_camera()
-				except Exception:
-					pass
-				self.pipeline = None
-				ok = False
-
-				# Fast mode: keep camera closed
-				if self.req_fast:
-					self.view_mode = "Fast"
-					self.fast_mode = True
-					self.event.emit("Fast mode enabled (no camera).")
-					self.camera_ok.emit(False)
-				else:
-					self.fast_mode = False
-					# Reopen with requested streams
-					ok = self._open_camera(self.req_depth, self.req_rgb)
-					self.camera_ok.emit(ok)
-
-			authority = "LIVE" if (self.ctrl and self.ctrl.live_enabled) else "SIM"
-
-			# Fast mode
-			if self.req_fast:
-				self.status.emit("Camera: FAST mode (no live feed)")
-				time.sleep(0.01)
-				continue
-			
-			if not ok:
-				# Show placeholder and retry occasionally
-				frame = np.zeros((480, 640, 3), np.uint8)
-				cv2.putText(frame, "No camera connection", (60, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-				self.frame.emit(qimage_from_bgr(frame))
-				self.status.emit("Camera: DISCONNECTED")
-				time.sleep(0.2)
+				self._close_camera()
 				ok = self._open_camera(self.req_depth, self.req_rgb)
 				self.camera_ok.emit(ok)
+				if self.req_fast:
+					self.frame.emit(qimage_from_bgr(cv2.imread(FAST_IM)))
+
+			authority = "LIVE" if (self.ctrl and self.ctrl.live_enabled) else "SIM"
+			
+			if not ok:
+				now = time.time()
+				# backoff: retry every 2s
+				next_try = getattr(self, "_next_reopen_ts", 0.0)
+				if now >= next_try:
+					# self.frame.emit(qimage_from_bgr(self.SEARCH_CARD))
+					self.status.emit("Camera: DISCONNECTED")
+					# try reopen
+					ok = self._open_camera(self.req_depth, self.req_rgb)
+					self.camera_ok.emit(ok)
+					# set next retry time
+					self._next_reopen_ts = now + 5.0
+				time.sleep(0.02)
 				continue
 
 			try:
-				frames = self.pipeline.wait_for_frames(1000)
+				frames = self.pipeline.wait_for_frames(5000)
 			except Exception:
 				self.event.emit("Frame grab timeout.")
 				ok = False
 				self._close_camera()
 				self.camera_ok.emit(False)
 				continue
+
+			depth_frame  = None
+			colour_frame = None
 			
-			if self.req_depth and self.req_rgb: 
-				self.view_mode = "Both"
+			if self.req_fast:
 				depth_frame = frames.get_depth_frame()
-				colour_frame = frames.get_color_frame()
-			if self.req_depth and not self.req_rgb: 
-				self.view_mode = "Depth"
-				depth_frame = frames.get_depth_frame()
-				colour_frame = None
-			if not self.req_depth and self.req_rgb: 
-				self.view_mode = "RGB"
-				depth_frame = None
-				colour_frame = frames.get_color_frame()
+				if not self._valid_frame(depth_frame):
+					self.event.emit("Depth frame missing this cycle.")
+					continue
+				self.view_mode = "Fast"
+			else:
+				if self.req_depth:
+					depth_frame = frames.get_depth_frame()
+					if not self._valid_frame(depth_frame):
+						self.event.emit("Depth frame missing this cycle.")
+						continue
+				if self.req_rgb:
+					colour_frame = frames.get_color_frame()
+					if not self._valid_frame(colour_frame):
+						# colour often needs a cycle or two after restart
+						self.event.emit("Color frame missing this cycle.")
+
+				if self.req_depth and self.req_rgb: self.view_mode = "Both"
+				if self.req_depth and not self.req_rgb: self.view_mode = "Depth"
+				if not self.req_depth and self.req_rgb: self.view_mode = "RGB"
 
 			# Apply RS filters if available
 			# try:
@@ -748,22 +764,37 @@ class CameraWorker(QtCore.QThread):
 
 			# Assemble display frame depending on mode
 			show_bgr = None
-			if self.view_mode == "Depth":
+			if self.view_mode == "Fast":
 				depth_u16 = np.asanyarray(depth_frame.get_data())
 				h, w = depth_u16.shape
-				show_bgr = colourise_depth(depth_u16, self.depth_scale)
 
-			elif self.view_mode == "Both" and colour_frame is not None:
-				depth_u16 = np.asanyarray(depth_frame.get_data())
+			elif self.view_mode == "Depth":
+				depth_u16 = self._as_np(depth_frame)
+				if depth_u16 is None:
+					continue
 				h, w = depth_u16.shape
-				d = colourise_depth(depth_u16, self.depth_scale)
-				c = np.asanyarray(colour_frame.get_data()).copy()
-				show_bgr = np.hstack([d, c])
+				depth = colourise_depth(depth_u16, self.depth_scale)
+				try: depth_overlay = self._overlay_plane_on_depth(depth)
+				except Exception: depth_overlay = depth
+				show_bgr = depth_overlay
 
-			elif self.view_mode == "RGB" and colour_frame is not None:
-				colour_im = colour_frame.get_data()
-				h, w = colour_im.shape[:2]
-				show_bgr = np.asanyarray(colour_im).copy()
+			elif self.view_mode == "Both":
+				depth_u16 = self._as_np(depth_frame)
+				h, w = depth_u16.shape
+				depth = colourise_depth(depth_u16, self.depth_scale)
+				try: depth_overlay = self._overlay_plane_on_depth(depth)
+				except Exception: depth_overlay = depth
+				d = depth_overlay
+				if self._valid_frame(colour_frame):
+					c = self._as_np(colour_frame)
+					show_bgr = np.hstack([d, c])
+
+			elif self.view_mode == "RGB" and self._valid_frame(colour_frame):
+				c = self._as_np(colour_frame)
+				if c is None:
+					continue
+				h, w = c.shape[:2]
+				show_bgr = c.copy()
 
 
 			# If RGB only, no tracking
@@ -780,7 +811,7 @@ class CameraWorker(QtCore.QThread):
 				}
 
 				# Point cloud
-				if self.pc is not None:
+				if self.pc is not None and self.enable_pointcloud:
 					self._cloud_counter = (self._cloud_counter + 1) % self._cloud_every
 					if self._cloud_counter == 0:
 						try:
@@ -853,7 +884,10 @@ class CameraWorker(QtCore.QThread):
 						self.undetected_count = 0
 
 						# Intercept + comms
-						t_hit, p_hit = self.ekf.predict_intercept_with_plane(PLANE_NORMAL, PLANE_D, t_max=2.0)
+						n_use = np.asarray(self.plane_n, float).reshape(3) if self.plane_n is not None else np.asarray(PLANE_NORMAL, float)
+						d_use = float(self.plane_d) if self.plane_d is not None else float(PLANE_D)
+						t_hit, p_hit = self.ekf.predict_intercept_with_plane(n_use, d_use, t_max=2.0)
+
 						if t_hit is not None and p_hit is not None:
 							now = time.time()
 							# Publish to SIM (rate-limited)
@@ -892,7 +926,7 @@ class CameraWorker(QtCore.QThread):
 
 				# Review tick
 				if self.enable_record:
-					self.review.tick(depth_u16, meta)
+					self.review.tick(show_bgr, meta)
 
 			if (show_bgr is not None) and (self.view_mode != "Fast"):
 				self.frame.emit(qimage_from_bgr(show_bgr))
@@ -925,6 +959,96 @@ class CameraWorker(QtCore.QThread):
 
 	def stop(self):
 		self._running = False
+	
+	def _device_present(self) -> bool:
+		try:
+			ctx = rs.context()
+			return len(ctx.query_devices()) > 0
+		except Exception:
+			return False
+
+	def set_enable_pointcloud(self, enable: bool):
+		self.enable_pointcloud = bool(enable)
+		# If depth stream is active and pipeline is up, create pc immediately
+		if self.enable_pointcloud and self.pipeline is not None and self.pc is None and self.req_depth:
+			try:
+				self.pc = rs.pointcloud()
+			except Exception:
+				self.pc = None
+		if not self.enable_pointcloud:
+			self.pc = None
+			with self._cloud_lock:
+				self._last_cloud = None
+
+	def _plane_cam_vectors(self):
+		po = self.plane_overlay
+		if not po or not po.get("visible", True):
+			return None
+
+		p0 = np.asarray(po["p0"], float).reshape(3)
+		u  = np.asarray(po["u"],  float).reshape(3)
+		v  = np.asarray(po["v"],  float).reshape(3)
+		w  = float(po.get("width_m", 0.7))
+		l  = float(po.get("length_m", 0.7))
+
+		# Undo the wizard's scene flip if it was enabled there
+		# if po.get("invert_y", True):
+		# 	p0 = p0.copy(); u = u.copy(); v = v.copy()
+		# 	p0[1] *= -1.0; u[1] *= -1.0; v[1] *= -1.0
+
+		return p0, u, v, w, l
+
+	def _overlay_plane_on_depth(self, depth_bgr):
+		try:
+			if depth_bgr is None or self.intrinsics is None:
+				return depth_bgr
+
+			po = self.plane_overlay
+			if not po or not po.get("visible", True):
+				return depth_bgr
+
+			# plane in *scene-flipped* space (as per your current pipeline)
+			p0 = np.asarray(po["p0"], float).reshape(3)
+			u  = np.asarray(po["u"],  float).reshape(3)
+			v  = np.asarray(po["v"],  float).reshape(3)
+			w  = float(po.get("width_m", 0.7))
+			l  = float(po.get("length_m", 0.7))
+
+			p0p = p0.copy(); up = u.copy(); vp = v.copy()
+
+			hx, hz = 0.5*w, 0.5*l
+			corners_3d = np.array([
+				p0p + (-hx)*up + (-hz)*vp,
+				p0p + ( hx)*up + (-hz)*vp,
+				p0p + ( hx)*up + ( hz)*vp,
+				p0p + (-hx)*up + ( hz)*vp,
+			], dtype=float)
+
+			# 3D→pixel projection
+			pts = [rs.rs2_project_point_to_pixel(self.intrinsics, c.astype(float).tolist())
+				for c in corners_3d]
+			poly = np.array([[int(p[0]), int(p[1])] for p in pts], dtype=np.int32)
+
+			# clamp to image
+			h, wimg = depth_bgr.shape[:2]
+			poly[:,0] = np.clip(poly[:,0], 0, wimg-1)
+			poly[:,1] = np.clip(poly[:,1], 0, h-1)
+
+			out = depth_bgr.copy()
+			overlay = depth_bgr.copy()
+
+			# fill (low alpha)
+			cv2.fillPoly(overlay, [poly], color=(200, 255, 255), lineType=cv2.LINE_AA)
+			out = cv2.addWeighted(overlay, 0.15, out, 0.85, 0.0)
+
+			# edge (higher alpha look = solid polyline)
+			cv2.polylines(out, [poly], isClosed=True, color=(200, 255, 255),
+						thickness=2, lineType=cv2.LINE_AA)
+			return out
+		except Exception:
+			# fail safe: return the input frame untouched
+			return depth_bgr
+
 # ==================================================================
 
 
@@ -991,7 +1115,7 @@ class MainWindow(QtWidgets.QMainWindow):
 				lbl = QtWidgets.QLabel(ch)
 				lbl.setObjectName("titleLabel")
 				spaced.addWidget(lbl, 1, QtCore.Qt.AlignCenter)
-			spaced.addWidget(small_logo, 1, QtCore.Qt.AlignCenter)   # <- this is the “O”
+			spaced.addWidget(small_logo, 1, QtCore.Qt.AlignCenter) 
 			lbl_t = QtWidgets.QLabel("T"); lbl_t.setObjectName("titleLabel")
 			spaced.addWidget(lbl_t, 1, QtCore.Qt.AlignCenter)
 			header = spaced
@@ -1101,6 +1225,7 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.worker.camera_ok.connect(self.on_camera_ok)
 
 		self.plane_setup._set_worker(self.worker)
+		self._load_plane_from_json()
 
 		self.chk_depth.toggled.connect(self._apply_streams)
 		self.chk_rgb.toggled.connect(self._apply_streams)
@@ -1113,18 +1238,74 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.btn_load_review.clicked.connect(self._load_review)
 		self.rec_chk.toggled.connect(self._on_toggle_record)
 
+		self.FAST_CARD = QtGui.QPixmap(FAST_IM)
+		self.SEARCH_CARD = QtGui.QPixmap(SEARCH_IM)
+
 		# Start worker
 		self.worker.start()
 
 	def closeEvent(self, e):
 		self.worker.stop()
 		self.worker.wait(1500)
-		# try:
-		# 	if self.rev_cap:
-		# 		self.rev_cap.release()
-		# except Exception:
-		# 	pass
 		return super().closeEvent(e)
+	
+	def _load_plane_from_json(self, path=None):
+		try_path = os.path.join(os.getcwd(), "Ball_Tracking/plane_wizard_state.json")
+
+		state = None; chosen = None
+		if try_path and os.path.isfile(try_path):
+			try:
+				with open(try_path, "r", encoding="utf-8") as f:
+					state = json.load(f); chosen = try_path
+			except Exception: state = None; chosen = None
+	
+		if not state:
+			self.on_event("Plane config: no JSON found.")
+			return
+
+		self.on_event(f"Plane config: loaded {os.path.basename(chosen)}")
+
+		# Push plane overlay
+		pl = state.get("plane")
+		flags = state.get("flags", {})
+		invert_y = bool(flags.get("invert_y", True))
+		visible = bool(flags.get("plane_visible", True))
+		if pl:
+			po = {
+				"p0": pl.get("p0", [0,0,1]),
+				"u":  pl.get("u",  [1,0,0]),
+				"v":  pl.get("v",  [0,0,1]),
+				"width_m":  float(pl.get("width_m", 0.7)),
+				"length_m": float(pl.get("length_m", 0.7)),
+				"visible":  bool(pl.get("visible", visible)),
+				"invert_y": invert_y,
+			}
+			self.worker.plane_overlay = po
+
+			# Also update intercept plane n,d from this (current pose in JSON)
+			# Note: JSON stores final plane (after local edits), so use that normal & p0.
+			n = np.asarray(pl.get("normal", [0,1,0]), float).reshape(3)
+			p0 = np.asarray(pl.get("p0", [0,0,1]), float).reshape(3)
+
+			# # Undo wizard invert_y to get camera coords
+			# if invert_y:
+			# 	n = n.copy(); p0 = p0.copy()
+			# 	n[1] *= -1.0; p0[1] *= -1.0
+
+			n_norm = np.linalg.norm(n)
+			if n_norm > 1e-9:
+				n = n / n_norm
+
+			d = -float(n @ p0)
+			self.worker.plane_n = n
+			self.worker.plane_d = d
+
+			self.on_event(f"Plane set: n={n.round(3).tolist()}, d={d:.3f}, size=({po['width_m']:.3f},{po['length_m']:.3f})m, visible={po['visible']}")
+		else:
+			self.worker.plane_overlay = None
+			self.worker.plane_n = np.array(PLANE_NORMAL, float)
+			self.worker.plane_d = float(PLANE_D)
+
 	
 	def _enter_review(self, path: str):
 		if self.review_page.load_video(path):
@@ -1144,6 +1325,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 	def _enter_plane_setup(self):
 		# give the wizard the current worker before showing it
+		self.worker.set_enable_pointcloud(True)
 		self.plane_setup._set_worker(self.worker)
 		# hide the right dock while in the wizard
 		self.findChild(QtWidgets.QDockWidget, "rightDock").hide()
@@ -1152,12 +1334,16 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.on_event("Plane setup: entering")
 
 	def _plane_canceled(self):
+		self.worker.enable_pointcloud = False
 		self.on_event("Plane setup: canceled")
 		self.stack.setCurrentIndex(0)  # back to live
 		self.findChild(QtWidgets.QDockWidget, "rightDock").show()
 
 	def _plane_saved(self, box):
+		self.worker.enable_pointcloud = False
 		self.on_event(f"Plane setup: saved box {box}")
+		time.sleep(1)
+		self._load_plane_from_json()
 		self.worker.search_box = box
 		self.stack.setCurrentIndex(0)  # back to live
 		self.findChild(QtWidgets.QDockWidget, "rightDock").show()
@@ -1203,15 +1389,26 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.chk_depth.setEnabled(not want_fast)
 		self.chk_rgb.setEnabled(not want_fast)
 
+		# if want_fast:
+		# 	self.video.setPixmap(self.FAST_CARD.scaled(self.video.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+
 		# Request reconfigure in the worker thread
 		self.worker.request_reconfig(want_depth, want_rgb, want_fast)
 
 	# ---------- Live updates ----------
 	@QtCore.pyqtSlot(QtGui.QImage)
 	def on_frame(self, qimg):
-		self.video.setPixmap(QtGui.QPixmap.fromImage(qimg).scaled(
-			self.video.width(), self.video.height(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
-		))
+		if not hasattr(self, "_last_video_size"):
+			self._last_video_size = self.video.size()
+
+		need_scale = (self._last_video_size != self.video.size())
+		pm = QtGui.QPixmap.fromImage(qimg)
+		if need_scale:
+			pm = pm.scaled(self.video.width(), self.video.height(),
+						QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+			self._last_video_size = self.video.size()
+
+		self.video.setPixmap(pm)
 
 	@QtCore.pyqtSlot(str)
 	def on_status(self, s):
@@ -1220,10 +1417,7 @@ class MainWindow(QtWidgets.QMainWindow):
 	@QtCore.pyqtSlot(bool)
 	def on_camera_ok(self, ok):
 		if not ok:
-			# show black screen with text
-			frame = np.zeros((480, 640, 3), np.uint8)
-			cv2.putText(frame, "No camera connection", (60, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-			self.on_frame(qimage_from_bgr(frame))
+			self.video.setPixmap(self.SEARCH_CARD.scaled(self.video.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
 
 	@QtCore.pyqtSlot(str)
 	def on_event(self, msg):
@@ -1237,42 +1431,6 @@ class MainWindow(QtWidgets.QMainWindow):
 			return
 		self.on_event(f"Loaded review: {path}")
 		self._enter_review(path)
-
-		# if not path:
-		# 	return
-		# try:
-		# 	if self.rev_cap:
-		# 		self.rev_cap.release()
-		# 	self.rev_cap = cv2.VideoCapture(path)
-		# 	self.rev_total = int(self.rev_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-		# 	self.scrub.setRange(0, max(0, self.rev_total-1))
-		# 	self.scrub.setEnabled(True)
-		# 	self.btn_play.setEnabled(True)
-		# 	self.rev_play = False
-		# 	self._show_review_frame(0)
-		# 	self.on_event(f"Loaded review: {path}")
-		# except Exception as e:
-		# 	self.on_event(f"Failed to load review: {e}")
-
-	# def _show_review_frame(self, idx):
-	# 	if not self.rev_cap: return
-	# 	self.rev_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-	# 	ok, frame = self.rev_cap.read()
-	# 	if not ok: return
-	# 	self.on_frame(qimage_from_bgr(frame))
-
-	# def _tick_review(self):
-	# 	if not (self.rev_cap and self.rev_play): return
-	# 	pos = int(self.rev_cap.get(cv2.CAP_PROP_POS_FRAMES))
-	# 	ok, frame = self.rev_cap.read()
-	# 	if not ok:
-	# 		self.rev_play = False
-	# 		self.rev_timer.stop()
-	# 		return
-	# 	self.on_frame(qimage_from_bgr(frame))
-	# 	self.scrub.blockSignals(True)
-	# 	self.scrub.setValue(min(self.rev_total-1, pos))
-	# 	self.scrub.blockSignals(False)
 	
 	def _on_toggle_record(self, v):
 		v = bool(v)
