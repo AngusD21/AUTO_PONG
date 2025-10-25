@@ -11,122 +11,8 @@ import pyrealsense2 as rs
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
-# =========================== UI HELPERS =========================
-AXIS_COLORS = {
-	"x": QtGui.QColor(220,  0,  0),
-	"y": QtGui.QColor( 0, 200,  0),
-	"z": QtGui.QColor( 0, 0, 200),
-}
-
-def slider_style_for(color: QtGui.QColor) -> str:
-	c = color.name()
-	# neutral groove, colored square handle
-	return f"""
-	QSlider::groove:horizontal {{
-		height: 6px; background: #2d2d2f; border-radius: 3px;
-	}}
-	QSlider::sub-page:horizontal {{ background: transparent; }}
-	QSlider::add-page:horizontal {{ background: transparent; }}
-	QSlider::handle:horizontal {{
-		background: {c};
-		width: 14px; height: 14px; margin: -5px 0; border-radius: 3px;
-		border: 1px solid rgba(255,255,255,0.15);
-	}}
-	QSlider::tick-mark:horizontal {{
-		background: #6a6a6a;
-	}}
-	"""
-
-def make_full_slider_row(label_text: str, minv: float, maxv: float, step: float,
-						init: float, axis_key: str, suffix: str):
-	container = QtWidgets.QWidget()
-	v = QtWidgets.QVBoxLayout(container); v.setContentsMargins(0,0,0,0); v.setSpacing(2)
-
-	row = QtWidgets.QWidget()
-	h = QtWidgets.QHBoxLayout(row); h.setContentsMargins(0,0,0,0); h.setSpacing(8)
-
-	lbl = QtWidgets.QLabel(label_text); lbl.setMinimumWidth(96)
-
-	sld = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-	sld.setStyleSheet(slider_style_for(AXIS_COLORS[axis_key]))
-	sld.setCursor(QtCore.Qt.PointingHandCursor)
-	sld.setTickPosition(QtWidgets.QSlider.TicksBelow)
-	# tick interval ~25 steps
-	total_steps = max(1, int(round((maxv - minv) / step)))
-	sld.setMinimum(0); sld.setMaximum(total_steps)
-	sld.setSingleStep(1); sld.setPageStep(max(2, total_steps // 20))
-	sld.setTickInterval(max(1, total_steps // 12))
-
-	spin = QtWidgets.QDoubleSpinBox()
-	spin.setRange(minv, maxv); spin.setSingleStep(step); spin.setDecimals(3); spin.setSuffix(suffix)
-	spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
-	spin.setFixedWidth(90)
-
-	def idx_to_value(i: int) -> float:
-		return float(minv + i * step)
-	def value_to_idx(v: float) -> int:
-		return int(round((v - minv) / step))
-	def set_spin_display(v: float):
-		spin.setValue(v)
-
-	# init
-	sld.blockSignals(True); sld.setValue(value_to_idx(init)); sld.blockSignals(False)
-	spin.blockSignals(True); spin.setValue(init); spin.blockSignals(False)
-
-	h.addWidget(lbl)
-	h.addWidget(sld, 1)
-	h.addWidget(spin)
-
-	# ticks labels row under the slider
-	ticks = QtWidgets.QWidget()
-	th = QtWidgets.QHBoxLayout(ticks); th.setContentsMargins(96, 0, 90, 0); th.setSpacing(0)  # align under slider (accounts for label+spin widths)
-	lb_min = QtWidgets.QLabel(f"{minv:.3f}{suffix}")
-	lb_mid = QtWidgets.QLabel(f"{(0.5*(minv+maxv)):.3f}{suffix}")
-	lb_max = QtWidgets.QLabel(f"{maxv:.3f}{suffix}")
-	lb_min.setStyleSheet("color:#aaaaaa;"); lb_mid.setStyleSheet("color:#aaaaaa;"); lb_max.setStyleSheet("color:#aaaaaa;")
-	th.addWidget(lb_min, 0, QtCore.Qt.AlignLeft)
-	th.addWidget(lb_mid, 1, QtCore.Qt.AlignHCenter)
-	th.addWidget(lb_max, 0, QtCore.Qt.AlignRight)
-
-	v.addWidget(row)
-	v.addWidget(ticks)
-
-	return container, sld, spin, idx_to_value, value_to_idx, set_spin_display
-
-def _backing_spin(minv, maxv, step, init):
-	b = QtWidgets.QDoubleSpinBox()
-	b.setRange(minv, maxv); b.setSingleStep(step); b.setDecimals(6); b.setValue(init)
-	b.hide()
-	return b
-
-def _link_span_to_half(span_box, half_spin):
-	def f(v):
-		half_spin.blockSignals(True); half_spin.setValue(v*0.5); half_spin.blockSignals(False)
-	span_box.valueChanged.connect(f)
-
-def _link_half_to_span(half_spin, span_box):
-	def f(v):
-		span_box.blockSignals(True); span_box.setValue(v); span_box.blockSignals(False)
-	half_spin.valueChanged.connect(f)
-
-def _span_box(label, init):
-	wrap = QtWidgets.QWidget(); hl = QtWidgets.QHBoxLayout(wrap); hl.setContentsMargins(0,0,0,0); hl.setSpacing(6)
-	lab = QtWidgets.QLabel(label)
-	spn = QtWidgets.QDoubleSpinBox(); spn.setRange(0.05, 10.0); spn.setDecimals(3); spn.setSuffix(" m")
-	spn.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons); spn.setFixedWidth(120)
-	spn.setValue(init)
-	hl.addWidget(lab); hl.addWidget(spn)
-	return wrap, spn
-
-def _colored_span(label, color_key, rng, init):
-	wrap = QtWidgets.QWidget()
-	hl = QtWidgets.QHBoxLayout(wrap); hl.setContentsMargins(0,0,0,0); hl.setSpacing(6)
-	lab = QtWidgets.QLabel(label); lab.setStyleSheet(f"color:{AXIS_COLORS[color_key].name()}")
-	spn = QtWidgets.QDoubleSpinBox(); spn.setRange(*rng); spn.setDecimals(3); spn.setValue(init); spn.setSuffix(" m")
-	spn.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons); spn.setFixedWidth(120)
-	hl.addWidget(lab); hl.addWidget(spn)
-	return wrap, spn
-#==============================================================
+from Ball_Tracking.graphics_objects import  CollapsibleCard, RangeSlider, AxisGlyph, AXIS_COLORS
+from Ball_Tracking.graphics_objects import  _backing_spin, _colored_span, _link_half_to_span, _link_span_to_half,make_full_slider_row, _span_box
 
 #======================= PLANE OBJECT =========================
 @dataclass
@@ -148,7 +34,7 @@ class TablePlane:
 		p_proj = p - h * self.n
 		rel = p_proj - self.p0
 		return float(self.u @ rel), float(self.v @ rel)
-	
+#===========================================================	
 
 class PlaneSetupWizard(QtWidgets.QWidget):
 	saved = QtCore.pyqtSignal(dict)   # emits box dict on Save
@@ -163,6 +49,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		self.box_axes = []
 		self.box_visible = True
 		self.pts_visible = True
+		self.roi_visible = True
 		self._visual_flip_y = True
 
 		# Table plane state
@@ -287,12 +174,19 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self.roll  = _backing_spin(-180.0, 180.0, 0.5, 0.0)
 
 			# --- Right sidebar (cards) ---
-			right = QtWidgets.QVBoxLayout()
-			right.setSpacing(12)
+			scroll = QtWidgets.QScrollArea()
+			scroll.setWidgetResizable(True)
+			panel_layout.addWidget(scroll, 1)
 
-		# ---------- REGION OF INTEREST CARD ----------
+			right_host = QtWidgets.QWidget()
+			right = QtWidgets.QVBoxLayout(right_host)
+			right.setContentsMargins(0,0,0,0)
+			right.setSpacing(12)
+			scroll.setWidget(right_host)
+
+		# ---------- PLANE ROI CARD ----------
 		if 1:
-			card_box = CollapsibleCard("REGION OF INTEREST")
+			card_box = CollapsibleCard("PLANE POINTS ROI")
 			# header full width + centered text
 			card_box._button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 			card_box._button.setStyleSheet(card_box._button.styleSheet() + " text-align:center;")
@@ -447,8 +341,124 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 
 			self.btn_fit_plane.clicked.connect(self._fit_table_plane)
 
-			right.addStretch(1)
-			panel_layout.addLayout(right)
+		# ---------- SEARCH AREA CARD --------
+		if 1:
+			card_roi = CollapsibleCard("SEARCH BOUNDS (above table)")
+			card_roi._button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+			card_roi._button.setStyleSheet(card_roi._button.styleSheet() + " text-align:center;")
+			roi_layout = card_roi.content_layout()
+
+			# Row: Visible
+			vis_row = QtWidgets.QHBoxLayout()
+			self.chk_roi_visible = QtWidgets.QCheckBox("Visible")
+			self.chk_roi_visible.setChecked(True)
+			vis_row.addWidget(self.chk_roi_visible)
+			roi_layout.addLayout(vis_row)
+
+			self.chk_roi_visible.toggled.connect(lambda v: (setattr(self, "roi_visible", bool(v)), self._update_plane_draw()))
+
+			# X extend with Mirror toggle
+			self.row_x, self.sld_x, self.spn_x, i2v_x, v2i_x, _ = make_full_slider_row("Extend X", -10.0, 10.0, 0.05, 
+																			  float(getattr(self, "roi_x_extend", 0.0)),  "x", "°")
+			self.chk_roi_mx = QtWidgets.QCheckBox("Mirror")
+			xwrap = QtWidgets.QWidget(); xh = QtWidgets.QHBoxLayout(xwrap); xh.setContentsMargins(0,0,0,0); xh.setSpacing(8)
+			xh.addWidget(self.row_x, 1); xh.addWidget(self.chk_roi_mx, 0)
+			roi_layout.addWidget(xwrap)
+
+			# Z extend with Mirror toggle
+			self.row_z, self.sld_z, self.spn_z, i2v_z, v2i_z, _ = make_full_slider_row("Extend Z", -10.0, 10.0, 0.05, 
+																			  float(getattr(self, "roi_z_extend", 0.0)), "z", "°")
+			self.chk_roi_mz = QtWidgets.QCheckBox("Mirror")
+			zwrap = QtWidgets.QWidget(); zh = QtWidgets.QHBoxLayout(zwrap); zh.setContentsMargins(0,0,0,0); zh.setSpacing(8)
+			zh.addWidget(self.row_z, 1); zh.addWidget(self.chk_roi_mz, 0)
+			roi_layout.addWidget(zwrap)
+
+			# Height band (min/max) above plane, meters
+			row_h = QtWidgets.QWidget(); hh = QtWidgets.QHBoxLayout(row_h); hh.setContentsMargins(0,0,0,0); hh.setSpacing(8)
+			lab_h = QtWidgets.QLabel("Height above plane")
+			self.sp_roi_ymin = QtWidgets.QDoubleSpinBox()
+			self.sp_roi_ymin.setRange(0.0, 3.0); self.sp_roi_ymin.setDecimals(3); self.sp_roi_ymin.setSingleStep(0.01); self.sp_roi_ymin.setSuffix(" m")
+			self.sp_roi_ymin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+			self.sp_roi_ymax = QtWidgets.QDoubleSpinBox()
+			self.sp_roi_ymax.setRange(0.0, 3.0); self.sp_roi_ymax.setDecimals(3); self.sp_roi_ymax.setSingleStep(0.01); self.sp_roi_ymax.setSuffix(" m")
+			self.sp_roi_ymax.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+
+			self.rs_y = RangeSlider(QtCore.Qt.Horizontal)
+			self.rs_y.setMinimum(0); self.rs_y.setMaximum(3000)  # map mm 0..5000
+			# init from current values (meters -> mm)
+			ymin0 = int(round(1000.0 * float(getattr(self, "roi_y_min", 0.0))))
+			ymax0 = int(round(1000.0 * float(getattr(self, "roi_y_max", 0.2))))
+			self.rs_y.setLowerValue(ymin0)
+			self.rs_y.setUpperValue(ymax0)
+			self.sp_roi_ymin.setValue(ymin0 / 1000.0)
+			self.sp_roi_ymax.setValue(ymax0 / 1000.0)
+
+			hh.addWidget(lab_h)
+			hh.addWidget(self.sp_roi_ymin)
+			hh.addWidget(self.rs_y, 1)
+			hh.addWidget(self.sp_roi_ymax)
+			roi_layout.addWidget(row_h)
+
+			def _sync_y_from_slider():
+				self.sp_roi_ymin.blockSignals(True); self.sp_roi_ymin.setValue(self.rs_y.lowerValue()/1000.0); self.sp_roi_ymin.blockSignals(False)
+				self.sp_roi_ymax.blockSignals(True); self.sp_roi_ymax.setValue(self.rs_y.upperValue()/1000.0); self.sp_roi_ymax.blockSignals(False)
+				self.roi_y_min = self.sp_roi_ymin.value()
+				self.roi_y_max = self.sp_roi_ymax.value()
+				self._update_roi_preview()
+
+			def _sync_slider_from_spin():
+				lo = int(round(self.sp_roi_ymin.value()*1000.0))
+				hi = int(round(self.sp_roi_ymax.value()*1000.0))
+				self.rs_y.blockSignals(True); self.rs_y.setLowerValue(min(lo, hi)); self.rs_y.setUpperValue(max(lo, hi)); self.rs_y.blockSignals(False)
+				self.roi_y_min = float(min(self.sp_roi_ymin.value(), self.sp_roi_ymax.value()))
+				self.roi_y_max = float(max(self.sp_roi_ymin.value(), self.sp_roi_ymax.value()))
+				self._update_roi_preview()
+
+			self.rs_y.lowerValueChanged.connect(lambda _: _sync_y_from_slider())
+			self.rs_y.upperValueChanged.connect(lambda _: _sync_y_from_slider())
+			self.sp_roi_ymin.valueChanged.connect(lambda _: _sync_slider_from_spin())
+			self.sp_roi_ymax.valueChanged.connect(lambda _: _sync_slider_from_spin())
+
+			right.addWidget(card_roi)
+			right.addItem(QtWidgets.QSpacerItem(0, 0, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding))
+
+			self.roi_edges = gl.GLLinePlotItem(mode='lines', width=2.0)
+			self.gl.addItem(self.roi_edges)
+			if self._visual_flip_y:
+				self.roi_edges.scale(1.0, -1.0, 1.0)
+
+			def _apply_roi_from_ui():
+				self.roi_x_extend = float(self.spn_x.value())
+				self.roi_z_extend = float(self.spn_z.value())
+				self.roi_mirror_x = bool(self.chk_roi_mx.isChecked())
+				self.roi_mirror_z = bool(self.chk_roi_mz.isChecked())
+				self.roi_y_min = float(min(self.sp_roi_ymin.value(), self.sp_roi_ymax.value()))
+				self.roi_y_max = float(max(self.sp_roi_ymin.value(), self.sp_roi_ymax.value()))
+				self._update_roi_preview()
+
+			# initial populate (if loaded earlier)
+			self.chk_roi_mx.setChecked(getattr(self, "roi_mirror_x", False))
+			self.chk_roi_mz.setChecked(getattr(self, "roi_mirror_z", False))
+			self.sp_roi_ymin.setValue(getattr(self, "roi_y_min", 0.0))
+			self.sp_roi_ymax.setValue(getattr(self, "roi_y_max", 0.2))
+
+			# wire events
+			self.sld_x.valueChanged.connect(lambda i: (
+				self.spn_x.blockSignals(True), self.spn_x.setValue(i2v_x(i)), self.spn_x.blockSignals(False),
+				_apply_roi_from_ui()))
+			self.spn_x.valueChanged.connect(lambda v: (
+				self.sld_x.blockSignals(True), self.sld_x.setValue(v2i_x(v)), self.sld_x.blockSignals(False),
+				_apply_roi_from_ui()))
+
+			self.sld_z.valueChanged.connect(lambda i: (
+				self.spn_z.blockSignals(True), self.spn_z.setValue(i2v_z(i)), self.spn_z.blockSignals(False),
+				_apply_roi_from_ui()))
+			self.spn_z.valueChanged.connect(lambda v: (
+				self.sld_z.blockSignals(True), self.sld_z.setValue(v2i_z(v)), self.sld_z.blockSignals(False),
+				_apply_roi_from_ui()))
+
+			self.sp_roi_ymin.valueChanged.connect(lambda _: _apply_roi_from_ui())
+			self.sp_roi_ymax.valueChanged.connect(lambda _: _apply_roi_from_ui())
 
 		# ---------- BOTTOM BUTTONS ----------
 		if 1:
@@ -467,17 +477,20 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			btn_row.addWidget(self.btn_cancel)
 			btn_row.addWidget(self.btn_save)
 			panel_layout.addLayout(btn_row)
-			panel_layout.addStretch(1)
 
 			self.current_view = 0
 			# Wire updates into draw path
 			for w in (self.cx,self.cy,self.cz,self.ex,self.ey,self.ez,self.yaw,self.pitch,self.roll):
 				w.valueChanged.connect(self._update_box)
-			self.btn_reset.clicked.connect(self._reset_view_clicked) 
+			self.btn_reset.clicked.connect(self._set_default_view) 
 			self.btn_view_u.clicked.connect(lambda: self._view_from_axis(1))
 			self.btn_view_v.clicked.connect(lambda: self._view_from_axis(-1))
 			self.btn_save.clicked.connect(self._save)
 			self.btn_cancel.clicked.connect(self.canceled.emit)
+
+		panel.setFixedWidth(420) 
+		scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+		# right_host.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
 
 		# Load previous session defaults if present
 		self._load_defaults()
@@ -550,7 +563,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			R_plane_world = np.column_stack([self.plane.u, self.plane.n, self.plane.v])
 			self.glyph_plane.setRotationCam(Rw @ R_plane_world)
 
-
 	def _update_box(self):
 		if not self.box_visible:
 			# Hide
@@ -577,8 +589,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		lines = np.asarray(lines, float)
 
 		self.box_lines.setData(pos=lines, color=(1,1,1,0.9))
-
-		
+	
 	def _make_box_mesh(self, sx, sy, sz, color=(0.85,0.85,0.90,0.9)):
 		# axis-aligned cuboid centered at origin
 		x,y,z = sx*0.5, sy*0.5, sz*0.5
@@ -655,13 +666,21 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 				"center": [self.cx.value(), self.cy.value(), self.cz.value()],
 				"extents": [self.ex.value(), self.ey.value(), self.ez.value()],
 				"ypr_deg": [self.yaw.value(), self.pitch.value(), self.roll.value()],
-				"visible": bool(getattr(self, "box_visible", True)),
 				"color_points": bool(getattr(self, "pts_visible", True)),
 			},
 			"plane": None,
 			"flags": {
-				# "invert_y": bool(getattr(self, "invert_y", True)),
 				"plane_visible": bool(getattr(self, "pl_visible", True)),
+				"box_visible": bool(getattr(self, "box_visible", True)),
+				"roi_visible": bool(getattr(self, "roi_visible", True)),
+			},
+			"roi": {
+				"x_extend": float(getattr(self, "roi_x_extend", 0.0)),
+				"z_extend": float(getattr(self, "roi_z_extend", 0.0)),
+				"mirror_x": bool(getattr(self, "roi_mirror_x", False)),
+				"mirror_z": bool(getattr(self, "roi_mirror_z", False)),
+				"y_min":    float(getattr(self, "roi_y_min", 0.0)),
+				"y_max":    float(getattr(self, "roi_y_max", 0.2)),
 			}
 		}
 
@@ -683,24 +702,8 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		return state
 
 	def _save(self):
-		# Emit existing lightweight payload
-		out = dict(
-			center=[self.cx.value(), self.cy.value(), self.cz.value()],
-			extents=[self.ex.value(), self.ey.value(), self.ez.value()],
-			ypr_deg=[self.yaw.value(), self.pitch.value(), self.roll.value()]
-		)
-		if self.plane is not None:
-			out["plane"] = {
-				"p0": self.plane.p0.tolist(),
-				"normal": self.plane.n.tolist(),
-				"u": self.plane.u.tolist(),
-				"v": self.plane.v.tolist(),
-				"width_m": float(self.pl_size_x),
-				"length_m": float(self.pl_size_z),
-				"local_offsets": self._pl_off_local.tolist(),
-				"local_yaw_pitch_roll_deg": [float(self._pl_yaw), float(self._pl_pitch), float(self._pl_roll)],
-			}
-		self.saved.emit(out)
+		
+		self.saved.emit(None)
 
 		# Write the full state to JSON
 		state = self._state_to_dict()
@@ -777,7 +780,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		self.cy.setValue(float(p[1]))
 		self.cz.setValue(float(p[2]))
 
-
 	def _project_points(self, pts):
 		try:
 			PM = np.array(self.gl.projectionMatrix().data()).reshape(4,4).T
@@ -820,7 +822,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		roll  =  np.degrees(np.arctan2(R[1,0], R[1,1]))
 		return _wrap_deg(yaw), _wrap_deg(pitch), _wrap_deg(roll)
 	
-
 	def _view_from_axis(self, dir):
 	
 		if self.plane is None:
@@ -859,30 +860,16 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		dist = float(np.linalg.norm(eye - center))
 		self.gl.setCameraPosition(distance=dist, elevation=float(elev), azimuth=float(az))
 
-	
 	def _set_default_view(self):
-
-		# Where we want to “look at” (target/center). Using ~1m forward helps depth perception.
 		center_z = 1.0
-		try:
-			# If you want to center on the current box instead, uncomment:
-			# center = pg.Vector(self.cx.value(), self.cy.value(), self.cz.value())
-			center = pg.Vector(0.0, 0.0, center_z)
-		except Exception:
-			center = pg.Vector(0.0, 0.0, center_z)
+		center = pg.Vector(0.0, 0.0, center_z)
 
 		self.gl.opts['center'] = center
 
-		# Distance from the center, elevation (deg above XZ), azimuth (deg around Y).
-		# azimuth=0 → looking along +Z; elevation=25° → slightly above.
+		# Distance from the center, elevation (deg above XZ), azimuth (deg around Y)
 		self.gl.setCameraPosition(distance=2, elevation=-80, azimuth=90)
-
-		# If a previous orbit/drag left weird transforms, reset roll
-		self.gl.orbit(0, 0)  # no-op, but ensures internal state is valid
-
-	def _reset_view_clicked(self):
-		self._set_default_view()
-
+		self.gl.orbit(0, 0)
+	
 	def _plane_R_from_base_and_loc(self):
 		"""Compute [u n v] from base pose + local yaw/pitch/roll, no self.plane dependency."""
 		y, p, r = np.deg2rad([self._pl_yaw, self._pl_pitch, self._pl_roll])
@@ -923,7 +910,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		u, n, v = R[:,0], R[:,1], R[:,2]
 		self.plane = TablePlane(n=n, d=-(n @ p0), p0=p0, u=u, v=v)
 		self._update_plane_draw()
-		self._update_global_axes()
 
 	def _update_plane_draw(self):
 		"""Draw low-alpha plane surface and higher-alpha edges."""
@@ -954,7 +940,9 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 
 		edge_loop = np.vstack([verts, verts[0:1]])
 		self.plane_edges.setData(pos=edge_loop, color=(0.2, 0.8, 1.0, 0.7))
+
 		self._update_global_axes()
+		self._update_roi_preview()
 
 	def _plane_apply_size(self):
 		self.pl_size_x = float(self.sp_plane_w.value())
@@ -1003,7 +991,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		QtWidgets.QToolTip.showText(self.mapToGlobal(QtCore.QPoint(0,0)),
 									f"Plane RMS: {rms*1000:.1f} mm on {pts.shape[0]} pts")
 		
-	
 	def _load_defaults(self):
 		#Read JSON state (if exists) and apply as current defaults
 		if not os.path.isfile(self.config_path):
@@ -1028,12 +1015,20 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		if e:   self.ex.setValue(float(e[0])); self.ey.setValue(float(e[1])); self.ez.setValue(float(e[2]))
 		if ypr: self.yaw.setValue(float(ypr[0])); self.pitch.setValue(float(ypr[1])); self.roll.setValue(float(ypr[2]))
 
-		bv = box.get("visible")
-		if bv is not None:
-			self.box_visible = bool(bv)
-			self.chk_box_visible.blockSignals(True)
-			self.chk_box_visible.setChecked(self.box_visible)
-			self.chk_box_visible.blockSignals(False)
+		roi = state.get("roi", {})
+		self.roi_x_extend = float(roi.get("x_extend", 0.0))
+		self.roi_z_extend = float(roi.get("z_extend", 0.0))
+		self.roi_mirror_x = bool(roi.get("mirror_x", False))
+		self.roi_mirror_z = bool(roi.get("mirror_z", False))
+		self.roi_y_min    = float(roi.get("y_min", 0.0))
+		self.roi_y_max    = float(roi.get("y_max", 0.2))
+		
+		self.spn_x.blockSignals(True); self.spn_x.setValue(self.roi_x_extend); self.spn_x.blockSignals(False)
+		self.spn_z.blockSignals(True); self.spn_z.setValue(self.roi_z_extend); self.spn_z.blockSignals(False)
+		self.chk_roi_mx.setChecked(self.roi_mirror_x)
+		self.chk_roi_mz.setChecked(self.roi_mirror_z)
+		self.sp_roi_ymin.setValue(self.roi_y_min)
+		self.sp_roi_ymax.setValue(self.roi_y_max)
 
 		cp = box.get("color_points")
 		if cp is not None:
@@ -1062,8 +1057,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			# Size & visibility
 			self.pl_size_x = float(pl.get("width_m", 0.70))
 			self.pl_size_z = float(pl.get("length_m", 0.70))
-			vis = pl.get("visible", True)
-			self.pl_visible = bool(vis)
 			
 			self.sp_lx.setValue(self._pl_off_local[0])
 			self.sp_ly.setValue(self._pl_off_local[1])
@@ -1101,57 +1094,69 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self.chk_plane_visible.blockSignals(True)
 			self.chk_plane_visible.setChecked(self.pl_visible)
 			self.chk_plane_visible.blockSignals(False)
+		
+		if "box_visible" in fl:
+			self.box_visible = bool(fl["box_visible"])
+			self.chk_box_visible.blockSignals(True)
+			self.chk_box_visible.setChecked(self.box_visible)
+			self.chk_box_visible.blockSignals(False)
 
+		if "roi_visible" in fl:
+			self.roi_visible = bool(fl["roi_visible"])
+			self.chk_roi_visible.blockSignals(True)
+			self.chk_roi_visible.setChecked(self.roi_visible)
+			self.chk_roi_visible.blockSignals(False)
+	
+	def _roi_corners_ext(self, p0, u, v, n, w, l, y0, y1):
+		# same logic as main UI: mirror vs single-side, using self.roi_* values
+		hx, hz = 0.5*w, 0.5*l
+		ex, ez = float(getattr(self, "roi_x_extend", 0.0)), float(getattr(self, "roi_z_extend", 0.0))
 
-class AxisGlyph(QtWidgets.QFrame):
-	def __init__(self, title:str, parent=None):
-		super().__init__(parent)
-		self.setFixedHeight(64)
-		self.setMinimumWidth(120)
-		self._R_cam = np.eye(3)  # axes expressed in *camera* space
-		self._title = title
-		self.setStyleSheet("QFrame { background: #151518; border: 1px solid #303036; border-radius: 6px; }")
+		# along u
+		if getattr(self, "roi_mirror_x", False):
+			hx_neg = hx + abs(ex); hx_pos = hx + abs(ex)
+		else:
+			hx_neg = hx + (abs(ex) if ex < 0 else 0.0)
+			hx_pos = hx + (abs(ex) if ex > 0 else 0.0)
 
-	def setRotationCam(self, R_cam: np.ndarray):
-		if R_cam is None: return
-		self._R_cam = np.array(R_cam, float)
-		self.update()
+		# along v
+		if getattr(self, "roi_mirror_z", False):
+			hz_neg = hz + abs(ez); hz_pos = hz + abs(ez)
+		else:
+			hz_neg = hz + (abs(ez) if ez < 0 else 0.0)
+			hz_pos = hz + (abs(ez) if ez > 0 else 0.0)
 
-	def paintEvent(self, ev):
-		p = QtGui.QPainter(self)
-		p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-		w, h = self.width(), self.height()
-		cx, cy = w*0.5, h*0.62
-		scale = min(w, h) * 0.36  # slightly longer
+		# base 4
+		c00 = p0 + (-hx_neg)*u + (-hz_neg)*v
+		c10 = p0 + ( +hx_pos)*u + (-hz_neg)*v
+		c11 = p0 + ( +hx_pos)*u + ( +hz_pos)*v
+		c01 = p0 + (-hx_neg)*u + ( +hz_pos)*v
+		base = np.stack([c00,c10,c11,c01], axis=0)
 
-		p.setPen(QtGui.QColor("#bbbbbb"))
-		p.drawText(QtCore.QRectF(0, 2, w, 18), QtCore.Qt.AlignHCenter, self._title)
+		lo = base + n[None,:]*y0
+		hi = base + n[None,:]*y1
+		return np.vstack([lo, hi])  # 8x3
 
-		# Project using camera X (→) and Z (↑) so Z is clearly visible
-		axes = [("X", AXIS_COLORS["x"], self._R_cam[:,0]),
-				("Y", AXIS_COLORS["y"], self._R_cam[:,1]),
-				("Z", AXIS_COLORS["z"], self._R_cam[:,2])]
-		for _, color, vec in axes:
-			vx = float(vec[0])         # camera X
-			vz = float(vec[2])         # camera Z
-			sx = cx + scale * vx
-			sy = cy - scale * vz       # up is -Z on screen
+	def _update_roi_preview(self):
+		if self.plane is None or not self.roi_visible:
+			self.roi_edges.setData(pos=np.empty((0,3))); return
+		# plane basis/size
+		p0 = np.asarray(self.plane.p0, float)
+		u  = np.asarray(self.plane.u,  float)
+		v  = np.asarray(self.plane.v,  float)
+		n  = np.asarray(self.plane.n,  float)
+		w  = float(self.pl_size_x)
+		l  = float(self.pl_size_z)
+		y0 = float(getattr(self, "roi_y_min", 0.0))
+		y1 = float(getattr(self, "roi_y_max", 0.2))
 
-			pen = QtGui.QPen(color); pen.setWidth(2)   # thinner
-			p.setPen(pen)
-			p.drawLine(QtCore.QPointF(cx, cy), QtCore.QPointF(sx, sy))
-			# arrow head
-			dx, dy = sx-cx, sy-cy
-			L = math.hypot(dx, dy) + 1e-9
-			ux, uy = dx/L, dy/L
-			px, py = -uy, ux
-			head_len = 12.0; head_w = 5.0
-			tip = QtCore.QPointF(sx, sy)
-			left = QtCore.QPointF(sx - ux*head_len + px*head_w, sy - uy*head_len + py*head_w)
-			right= QtCore.QPointF(sx - ux*head_len - px*head_w, sy - uy*head_len - py*head_w)
-			p.setBrush(color)
-			p.drawPolygon(QtGui.QPolygonF([tip, left, right]))
-		p.end()
+		V = self._roi_corners_ext(p0, u, v, n, w, l, y0, y1)  # 8x3
+		# 12 edges
+		E = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
+		lines = []
+		for i,j in E:
+			lines.append(V[i]); lines.append(V[j])
+		self.roi_edges.setData(pos=np.asarray(lines, float), color=(0.85,0.85,0.85,0.9))
 
 
 def _fit_plane_svd(pts: np.ndarray):
@@ -1168,52 +1173,6 @@ def _fit_plane_svd(pts: np.ndarray):
 	h = P @ n
 	rms = float(np.sqrt(np.mean(h*h)))
 	return n, d, c, rms
-
-
-class CollapsibleCard(QtWidgets.QWidget):
-	"""
-	A simple minimisable 'card' with a chevron header.
-	"""
-	def __init__(self, title: str, parent=None):
-		super().__init__(parent)
-		self._content = QtWidgets.QWidget(self)
-		self._content.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-		self._content_layout = QtWidgets.QVBoxLayout(self._content)
-		self._content_layout.setContentsMargins(12, 8, 12, 12)
-		self._content_layout.setSpacing(8)
-
-		self._button = QtWidgets.QToolButton(self)
-		self._button.setText(title)
-		self._button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-		self._button.setArrowType(QtCore.Qt.DownArrow)
-		self._button.setCheckable(True)
-		self._button.setChecked(True)
-		self._button.clicked.connect(self._toggle)
-
-		frame = QtWidgets.QFrame(self)
-		frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
-		frame.setObjectName("CardFrame")
-		frame.setLayout(QtWidgets.QVBoxLayout())
-		frame.layout().setContentsMargins(0, 0, 0, 0)
-		frame.layout().addWidget(self._content)
-
-		lay = QtWidgets.QVBoxLayout(self)
-		lay.setContentsMargins(0, 0, 0, 0)
-		lay.setSpacing(4)
-		lay.addWidget(self._button)
-		lay.addWidget(frame)
-
-		self.setStyleSheet("""
-			QToolButton { font-weight:600; padding:6px 10px; }
-			QFrame#CardFrame { border:1px solid #404040; border-radius:8px; }
-		""")
-
-	def _toggle(self, checked):
-		self._button.setArrowType(QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow)
-		self._content.setVisible(checked)
-
-	def content_layout(self) -> QtWidgets.QVBoxLayout:
-		return self._content_layout
 
 
 def _Ry(a):

@@ -434,10 +434,13 @@ class CameraWorker(QtCore.QThread):
 		self.temporal = None
 		self.holes = None
 
-		self.crop_top = 0.0
-		self.crop_bottom = 0.0
-		self.crop_left = 0.0
-		self.crop_right = 0.0
+		# Interest region controls
+		self.roi_x_extend = 2.0
+		self.roi_z_extend = 10.0
+		self.roi_mirror_x = True  
+		self.roi_mirror_z = False  
+		self.roi_y_min = 0.00
+		self.roi_y_max = 5.0
 
 		# Plane setup
 		self.search_box = None
@@ -448,6 +451,12 @@ class CameraWorker(QtCore.QThread):
 		self._cloud_counter = 0
 		self.pc = None
 		self.enable_pointcloud = False
+		self.display_hz = 25.0      # UI refresh cap (Hz)
+		self._last_emit_ts = 0.0
+
+		self.draw_interest_region = True
+		self.draw_table_plane = True
+		self.colour_roi = True
 
 		self.plane_overlay = None   # dict with keys: p0,u,v,width_m,length_m,visible,invert_y
 		self.plane_n = np.array(PLANE_NORMAL, float).reshape(3)
@@ -773,21 +782,45 @@ class CameraWorker(QtCore.QThread):
 				if depth_u16 is None:
 					continue
 				h, w = depth_u16.shape
-				depth = colourise_depth(depth_u16, self.depth_scale)
-				try: depth_overlay = self._overlay_plane_on_depth(depth)
-				except Exception: depth_overlay = depth
-				show_bgr = depth_overlay
+
+				if self.colour_roi:
+					# Grey+Green path (no JET)
+					try:
+						show_bgr = self._render_interest_region(depth_u16, base_bgr=None)
+					except Exception:
+						# fall back to plain grey if something surprises us
+						grey = cv2.normalize(depth_u16, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+						show_bgr = cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
+				else:
+					# Normal JET + overlays path
+					depth = colourise_depth(depth_u16, self.depth_scale)
+					try:
+						depth = self._overlay_plane_on_depth(depth)
+					except Exception:
+						pass
+					try:
+						show_bgr = self._render_interest_region(depth_u16, base_bgr=depth)
+					except Exception:
+						show_bgr = depth
 
 			elif self.view_mode == "Both":
 				depth_u16 = self._as_np(depth_frame)
 				h, w = depth_u16.shape
-				depth = colourise_depth(depth_u16, self.depth_scale)
-				try: depth_overlay = self._overlay_plane_on_depth(depth)
-				except Exception: depth_overlay = depth
-				d = depth_overlay
+
+				if self.colour_roi:
+					# Left half is grey+green; right half is camera RGB
+					d = self._render_interest_region(depth_u16, base_bgr=None)
+				else:
+					depth = colourise_depth(depth_u16, self.depth_scale)
+					try:
+						depth = self._overlay_plane_on_depth(depth)
+					except Exception:
+						pass
+					d = self._render_interest_region(depth_u16, base_bgr=depth)
+
 				if self._valid_frame(colour_frame):
 					c = self._as_np(colour_frame)
-					show_bgr = np.hstack([d, c])
+					show_bgr = np.hstack([d, c]) if d is not None else c
 
 			elif self.view_mode == "RGB" and self._valid_frame(colour_frame):
 				c = self._as_np(colour_frame)
@@ -929,7 +962,10 @@ class CameraWorker(QtCore.QThread):
 					self.review.tick(show_bgr, meta)
 
 			if (show_bgr is not None) and (self.view_mode != "Fast"):
-				self.frame.emit(qimage_from_bgr(show_bgr))
+				now_emit = time.time()
+				if (now_emit - self._last_emit_ts) >= (1.0 / self.display_hz):
+					self._last_emit_ts = now_emit
+					self.frame.emit(qimage_from_bgr(show_bgr))
 
 			# FPS Calculation
 			now = time.time()
@@ -997,6 +1033,43 @@ class CameraWorker(QtCore.QThread):
 		# 	p0[1] *= -1.0; u[1] *= -1.0; v[1] *= -1.0
 
 		return p0, u, v, w, l
+	
+	def _roi_box_vertices_3d(self, p0, u, v, n, w, l, hmin, hmax):
+		base = self._roi_corners_3d(p0, u, v, w, l)  # 4x3
+		bottom = base + n[None, :] * float(hmin)
+		top    = base + n[None, :] * float(hmax)
+		return np.vstack([bottom, top])  # 8x3
+
+	def _project_points_px(self, pts3d):
+		"""Project Nx3 -> Nx2 pixel coords (int)."""
+		pts2d = [rs.rs2_project_point_to_pixel(self.intrinsics, p.astype(float).tolist()) for p in pts3d]
+		return np.array([[int(p[0]), int(p[1])] for p in pts2d], np.int32)
+
+	def _draw_roi_box_edges(self, img_bgr, verts3d, thickness=2):
+		if img_bgr is None: 
+			return img_bgr
+
+		verts2d = self._project_points_px(verts3d)
+		dists = np.linalg.norm(verts3d, axis=1)  # distance from camera (approx)
+		dmin, dmax = float(np.min(dists)), float(np.max(dists))
+
+		def edge_col(i, j):
+			d = 0.5*(dists[i] + dists[j])
+			t = 0.5 if (dmax <= dmin + 1e-9) else (d - dmin) / (dmax - dmin)
+			val = int(round(200*(1.0 - t) + 60*t))  # near=bright(200), far=dim(60)
+			return (val, val, val)
+
+		edges = [
+			(0,1),(1,2),(2,3),(3,0),     # bottom loop
+			(4,5),(5,6),(6,7),(7,4),     # top loop
+			(0,4),(1,5),(2,6),(3,7)      # pillars
+		]
+		for i, j in edges:
+			p1, p2 = tuple(verts2d[i]), tuple(verts2d[j])
+			cv2.line(img_bgr, p1, p2, edge_col(i, j), thickness, lineType=cv2.LINE_AA)
+
+		return img_bgr
+
 
 	def _overlay_plane_on_depth(self, depth_bgr):
 		try:
@@ -1004,7 +1077,7 @@ class CameraWorker(QtCore.QThread):
 				return depth_bgr
 
 			po = self.plane_overlay
-			if not po or not po.get("visible", True):
+			if not po or not self.draw_table_plane:
 				return depth_bgr
 
 			# plane in *scene-flipped* space (as per your current pipeline)
@@ -1048,6 +1121,128 @@ class CameraWorker(QtCore.QThread):
 		except Exception:
 			# fail safe: return the input frame untouched
 			return depth_bgr
+	
+	def _roi_corners_3d(self, p0, u, v, w, l):
+
+		hx, hz = 0.5*w, 0.5*l
+		ex = float(self.roi_x_extend)
+		ez = float(self.roi_z_extend)
+
+		# X (along u)
+		if self.roi_mirror_x:
+			hx_min = hx + abs(ex)
+			hx_max = hx + abs(ex)
+			neg_push_x = 0.0; pos_push_x = 0.0
+		else:
+			hx_min = hx; hx_max = hx
+			neg_push_x = abs(ex) if ex < 0 else 0.0  # extend -u side
+			pos_push_x = abs(ex) if ex > 0 else 0.0  # extend +u side
+
+		# Z (along v)
+		if self.roi_mirror_z:
+			hz_min = hz + abs(ez)
+			hz_max = hz + abs(ez)
+			neg_push_z = 0.0; pos_push_z = 0.0
+		else:
+			hz_min = hz; hz_max = hz
+			neg_push_z = abs(ez) if ez < 0 else 0.0  # extend -v side
+			pos_push_z = abs(ez) if ez > 0 else 0.0  # extend +v side
+
+		# Corners
+		c00 = p0 + (-(hx_min + neg_push_x))*u + (-(hz_min + neg_push_z))*v
+		c10 = p0 + ( +(hx_max + pos_push_x))*u + (-(hz_min + neg_push_z))*v
+		c11 = p0 + ( +(hx_max + pos_push_x))*u + ( +(hz_max + pos_push_z))*v
+		c01 = p0 + (-(hx_min + neg_push_x))*u + ( +(hz_max + pos_push_z))*v
+		return np.stack([c00, c10, c11, c01], axis=0)
+
+	def _roi_polygon_px(self, p0, u, v, w, l):
+		corners_3d = self._roi_corners_3d(p0, u, v, w, l)
+		pts = [rs.rs2_project_point_to_pixel(self.intrinsics, c.astype(float).tolist())
+			for c in corners_3d]
+		return np.array([[int(p[0]), int(p[1])] for p in pts], np.int32), corners_3d
+	
+
+	def _render_interest_region(self, depth_u16, base_bgr=None):
+
+		po = self.plane_overlay
+		if (self.intrinsics is None) or (po is None):
+			return base_bgr if base_bgr is not None else None
+
+		# Plane basis
+		p0 = np.asarray(po["p0"], float)
+		u  = np.asarray(po["u"],  float); u /= (np.linalg.norm(u)+1e-12)
+		v  = np.asarray(po["v"],  float); v /= (np.linalg.norm(v)+1e-12)
+		n  = np.cross(u, v);       n /= (np.linalg.norm(n)+1e-12)
+		w  = float(po.get("width_m", 0.7))
+		l  = float(po.get("length_m", 0.7))
+
+		# Height band relative to plane (meters)
+		hmin = float(self.roi_y_min)
+		hmax = float(self.roi_y_max)
+
+		# Prepare the background image
+		if self.colour_roi:
+			# Grey from depth_u16 (simple linear map on valid pixels)
+			depth_mm = depth_u16.astype(np.float32) * (self.depth_scale * 1000.0)
+			valid = depth_u16 > 0
+			if valid.any():
+				lo = float(np.percentile(depth_mm[valid], 2))
+				hi = float(np.percentile(depth_mm[valid], 98))
+				if hi <= lo: lo, hi = 400.0, 3000.0
+			else:
+				lo, hi = 400.0, 3000.0
+
+			norm = np.zeros_like(depth_mm, np.float32)
+			if valid.any():
+				norm[valid] = np.clip((depth_mm[valid] - lo) / (hi - lo + 1e-6), 0, 1)
+			grey_u8 = (norm * 255.0).astype(np.uint8)
+			out = cv2.cvtColor(grey_u8, cv2.COLOR_GRAY2BGR)
+			out[~valid] = (0,0,0)
+		else:
+			# Use whatever was already composed (e.g., JET + plane polygon)
+			out = base_bgr.copy() if base_bgr is not None else None
+			if out is None:
+				# fallback to a quick JET if none provided
+				out = colourise_depth(depth_u16, self.depth_scale)
+
+		# Build ROI mask in image (project polygon from plane) – we reuse the extended rectangle on plane.
+		poly_px, base_corners_3d = self._roi_polygon_px(p0, u, v, w, l)
+		h_img, w_img = depth_u16.shape
+		mask = np.zeros((h_img, w_img), np.uint8)
+		cv2.fillPoly(mask, [poly_px], 255)
+
+		# Vectorised deprojection only for masked pixels
+		ys, xs = np.nonzero(mask)
+		if xs.size > 0:
+			fx, fy = self.intrinsics.fx, self.intrinsics.fy
+			cx, cy = self.intrinsics.ppx, self.intrinsics.ppy
+			z_m = depth_u16[ys, xs].astype(np.float32) * self.depth_scale
+			valid = z_m > 0
+			if np.any(valid):
+				xs = xs[valid]; ys = ys[valid]; z_m = z_m[valid]
+				X = (xs - cx) * z_m / fx
+				Y = (ys - cy) * z_m / fy
+				Z = z_m
+				P = np.stack([X, Y, Z], axis=1)
+
+				# height above plane: h = n·(P - p0)
+				h = (P - p0[None, :]) @ n
+				in_band = (h >= hmin) & (h <= hmax)
+
+				if self.colour_roi:
+					# Bright green for in-band pixels; background stays grey
+					out[ys[in_band], xs[in_band]] = (0, 255, 80)
+				else:
+					# Optional light tint inside band (comment out to keep pure JET)
+					pass
+
+		# Draw the FULL 3D box if required
+		if self.draw_interest_region and out is not None:
+			verts3d = self._roi_box_vertices_3d(p0, u, v, n, w, l, hmin, hmax)
+			out = self._draw_roi_box_edges(out, verts3d, thickness=2)
+
+		return out
+
 
 # ==================================================================
 
@@ -1068,6 +1263,13 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.stack = QtWidgets.QStackedWidget()
 		self.setCentralWidget(self.stack)
 
+		# Worker
+		self.worker = CameraWorker()
+		self.worker.frame.connect(self.on_frame)
+		self.worker.status.connect(self.on_status)
+		self.worker.event.connect(self.on_event)
+		self.worker.camera_ok.connect(self.on_camera_ok)
+
 		# Page 0: Live
 		self.video = VideoLabel()
 		live_page = QtWidgets.QWidget()
@@ -1084,6 +1286,11 @@ class MainWindow(QtWidgets.QMainWindow):
 		# Page 2: Plane setup
 		self.plane_setup = PlaneSetupWizard(worker=None, parent=self)
 		self.stack.addWidget(self.plane_setup) # index 2
+		self._plane_cfg_path = os.path.join(os.getcwd(), "Ball_Tracking/plane_wizard_state.json")
+		self._plane_cfg_watcher = QtCore.QFileSystemWatcher(self)
+		if os.path.isfile(self._plane_cfg_path):
+			self._plane_cfg_watcher.addPath(self._plane_cfg_path)
+		self._plane_cfg_watcher.fileChanged.connect(self._on_plane_cfg_changed)
 
 		# --- Right dock = controls ---
 		dock = QtWidgets.QDockWidget("", self)
@@ -1166,34 +1373,26 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.plane_setup.saved.connect(self._plane_saved)
 		self.plane_setup.canceled.connect(self._plane_canceled)
 
-		# --- ROI sliders card ---
-		roi_box = QtWidgets.QWidget()
-		roi_layout = QtWidgets.QVBoxLayout(roi_box)
-		roi_layout.setContentsMargins(0,0,0,0)
-		roi_layout.setSpacing(6)
-		roi_layout.addWidget(QtWidgets.QLabel("Ignore region (crop)"))
-		# build sliders
-		def _mk_slider_row(text):
-			roww = QtWidgets.QHBoxLayout()
-			roww.addWidget(QtWidgets.QLabel(text))
-			s = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-			s.setRange(0, 50)  # 0..50%
-			s.setSingleStep(1)
-			roww.addWidget(s)
-			rw = QtWidgets.QWidget()
-			rw.setLayout(roww)
-			return s, rw
+		# --- Overlays card ---
+		self.chk_draw_plane = QtWidgets.QCheckBox("Draw plane overlay")
+		self.chk_draw_roi   = QtWidgets.QCheckBox("Draw interest region")
+		self.chk_colour_roi = QtWidgets.QCheckBox("Colour points in ROI")
 
-		self.s_top,    row_top    = _mk_slider_row("Top")
-		self.s_bottom, row_bottom = _mk_slider_row("Bottom")
-		self.s_left,   row_left   = _mk_slider_row("Left")
-		self.s_right,  row_right  = _mk_slider_row("Right")
+		self.chk_draw_plane.setChecked(True)
+		self.chk_draw_roi.setChecked(False)
+		self.chk_colour_roi.setChecked(False)
 
-		for rw in (row_top, row_bottom, row_left, row_right):
-			roi_layout.addWidget(rw)
+		card_over = make_card(self.chk_draw_plane, self.chk_draw_roi, self.chk_colour_roi)
+		root.addWidget(card_over)
 
-		card_roi = make_card(roi_box)
-		root.addWidget(card_roi)
+		def _apply_overlay_toggles():
+			self.worker.draw_table_plane = self.chk_draw_plane.isChecked()
+			self.worker.draw_interest_region = self.chk_draw_roi.isChecked()
+			self.worker.colour_roi = self.chk_colour_roi.isChecked()
+
+		self.chk_draw_plane.toggled.connect(_apply_overlay_toggles)
+		self.chk_draw_roi.toggled.connect(_apply_overlay_toggles)
+		self.chk_colour_roi.toggled.connect(_apply_overlay_toggles)
 
 		# --- Events (log) card ---
 		self.log = QtWidgets.QPlainTextEdit()
@@ -1217,23 +1416,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
 		dock.setWidget(panel)
 
-		# Worker
-		self.worker = CameraWorker()
-		self.worker.frame.connect(self.on_frame)
-		self.worker.status.connect(self.on_status)
-		self.worker.event.connect(self.on_event)
-		self.worker.camera_ok.connect(self.on_camera_ok)
-
 		self.plane_setup._set_worker(self.worker)
 		self._load_plane_from_json()
 
 		self.chk_depth.toggled.connect(self._apply_streams)
 		self.chk_rgb.toggled.connect(self._apply_streams)
 		self.chk_fast.toggled.connect(self._apply_streams)
-
 		self.send_chk.toggled.connect(self.worker.set_send_arduino)
-		for s in (self.s_top, self.s_bottom, self.s_left, self.s_right):
-			s.valueChanged.connect(self._apply_crop)
 
 		self.btn_load_review.clicked.connect(self._load_review)
 		self.rec_chk.toggled.connect(self._on_toggle_record)
@@ -1270,6 +1459,8 @@ class MainWindow(QtWidgets.QMainWindow):
 		flags = state.get("flags", {})
 		invert_y = bool(flags.get("invert_y", True))
 		visible = bool(flags.get("plane_visible", True))
+		roi = state.get("roi", {})
+
 		if pl:
 			po = {
 				"p0": pl.get("p0", [0,0,1]),
@@ -1282,15 +1473,15 @@ class MainWindow(QtWidgets.QMainWindow):
 			}
 			self.worker.plane_overlay = po
 
-			# Also update intercept plane n,d from this (current pose in JSON)
-			# Note: JSON stores final plane (after local edits), so use that normal & p0.
+			self.worker.roi_x_extend = float(roi.get("x_extend", 0.0))
+			self.worker.roi_z_extend = float(roi.get("z_extend", 0.0))
+			self.worker.roi_mirror_x = bool(roi.get("mirror_x", False))
+			self.worker.roi_mirror_z = bool(roi.get("mirror_z", False))
+			self.worker.roi_y_min    = float(roi.get("y_min", 0.0))
+			self.worker.roi_y_max    = float(roi.get("y_max", 0.2))
+
 			n = np.asarray(pl.get("normal", [0,1,0]), float).reshape(3)
 			p0 = np.asarray(pl.get("p0", [0,0,1]), float).reshape(3)
-
-			# # Undo wizard invert_y to get camera coords
-			# if invert_y:
-			# 	n = n.copy(); p0 = p0.copy()
-			# 	n[1] *= -1.0; p0[1] *= -1.0
 
 			n_norm = np.linalg.norm(n)
 			if n_norm > 1e-9:
@@ -1305,6 +1496,15 @@ class MainWindow(QtWidgets.QMainWindow):
 			self.worker.plane_overlay = None
 			self.worker.plane_n = np.array(PLANE_NORMAL, float)
 			self.worker.plane_d = float(PLANE_D)
+
+	def _on_plane_cfg_changed(self, path):
+		# Re-arm watcher (Windows sometimes drops it after a change)
+		try:
+			if os.path.isfile(path) and (path not in self._plane_cfg_watcher.files()):
+				self._plane_cfg_watcher.addPath(path)
+		except Exception:
+			pass
+		self._load_plane_from_json()
 
 	
 	def _enter_review(self, path: str):
@@ -1324,29 +1524,39 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.worker.start()
 
 	def _enter_plane_setup(self):
-		# give the wizard the current worker before showing it
 		self.worker.set_enable_pointcloud(True)
+		# speed up cloud while in wizard
+		self._prev_cloud_stride = self.worker._cloud_stride
+		self._prev_cloud_every  = self.worker._cloud_every
+		self.worker._cloud_stride = 2
+		self.worker._cloud_every  = 1
+
 		self.plane_setup._set_worker(self.worker)
-		# hide the right dock while in the wizard
 		self.findChild(QtWidgets.QDockWidget, "rightDock").hide()
-		# show plane wizard page
 		self.stack.setCurrentWidget(self.plane_setup)
 		self.on_event("Plane setup: entering")
 
 	def _plane_canceled(self):
 		self.worker.enable_pointcloud = False
+		# restore cloud cadence
+		self.worker._cloud_stride = getattr(self, "_prev_cloud_stride", 4)
+		self.worker._cloud_every  = getattr(self, "_prev_cloud_every", 3)
+
 		self.on_event("Plane setup: canceled")
-		self.stack.setCurrentIndex(0)  # back to live
+		self.stack.setCurrentIndex(0)
 		self.findChild(QtWidgets.QDockWidget, "rightDock").show()
 
 	def _plane_saved(self, box):
 		self.worker.enable_pointcloud = False
+		# restore cloud cadence
+		self.worker._cloud_stride = getattr(self, "_prev_cloud_stride", 4)
+		self.worker._cloud_every  = getattr(self, "_prev_cloud_every", 3)
+
 		self.on_event(f"Plane setup: saved box {box}")
-		time.sleep(1)
-		self._load_plane_from_json()
 		self.worker.search_box = box
-		self.stack.setCurrentIndex(0)  # back to live
+		self.stack.setCurrentIndex(0)
 		self.findChild(QtWidgets.QDockWidget, "rightDock").show()
+
 
 	def _wire_worker_signals(self):
 		self.worker.frame.connect(self.on_frame)
@@ -1371,14 +1581,6 @@ class MainWindow(QtWidgets.QMainWindow):
 		row.addWidget(s)
 		parent_layout.addLayout(row)
 		return s
-
-	def _apply_crop(self):
-		self.worker.set_crop(
-			self.s_top.value()/100.0,
-			self.s_bottom.value()/100.0,
-			self.s_left.value()/100.0,
-			self.s_right.value()/100.0,
-		)
 	
 	def _apply_streams(self):
 		want_fast  = self.chk_fast.isChecked()
