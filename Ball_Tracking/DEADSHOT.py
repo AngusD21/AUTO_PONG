@@ -16,6 +16,18 @@ import pyrealsense2 as rs
 from Ball_Tracking.review_wizard import ReviewPage, VideoLabel, qimage_from_bgr
 from Ball_Tracking.plane_wizard import PlaneSetupWizard, TablePlane
 from Ball_Tracking.graphics_objects import AspectImageView
+from Ball_Tracking.plane_math import (
+	overlay_plane_and_roi_on_bgr_po,
+	project_points_px,
+	project_points_px_masked,
+	plane_corners_world_from_overlay,
+	plane_poly_px_from_overlay,
+	roi_box_edges_px_from_overlay,
+	roi_mask_points_world,
+	roi_footprint_poly_px_from_overlay,
+	roi_box_edges_px_from_overlay_clipped,
+	clip_poly_points_to_image,
+)
 
 try:
 	from Communications.ipc import ControlListener, InterceptPublisher
@@ -244,44 +256,44 @@ def make_card(*widgets):
 	return card
 
 def colourise_depth(depth_u16: np.ndarray,
-                    depth_scale: float,
-                    clip_mm=(400, 3000),  
-                    use_auto_percentiles=False
-                   ) -> np.ndarray:
+					depth_scale: float,
+					clip_mm=(400, 3000),  
+					use_auto_percentiles=False
+				) -> np.ndarray:
 
-    # Convert to millimetres (for D435, depth_scale~0.001 so this equals depth_u16)
-    depth_mm = depth_u16.astype(np.float32) * (depth_scale * 1000.0)
-    valid = depth_u16 > 0
+	# Convert to millimetres (for D435, depth_scale~0.001 so this equals depth_u16)
+	depth_mm = depth_u16.astype(np.float32) * (depth_scale * 1000.0)
+	valid = depth_u16 > 0
 
-    # Choose visualization range
-    if use_auto_percentiles:
-        if valid.any():
-            lo = float(np.percentile(depth_mm[valid], 2))
-            hi = float(np.percentile(depth_mm[valid], 98))
-            if hi <= lo:   # fallback if scene is flat
-                lo, hi = 400.0, 3000.0
-        else:
-            lo, hi = 400.0, 3000.0
-    else:
-        lo, hi = clip_mm
+	# Choose visualization range
+	if use_auto_percentiles:
+		if valid.any():
+			lo = float(np.percentile(depth_mm[valid], 2))
+			hi = float(np.percentile(depth_mm[valid], 98))
+			if hi <= lo:   # fallback if scene is flat
+				lo, hi = 400.0, 3000.0
+		else:
+			lo, hi = 400.0, 3000.0
+	else:
+		lo, hi = clip_mm
 
-    # Clamp to [lo,hi] only on valid pixels
-    vis = np.zeros_like(depth_mm, dtype=np.float32)
-    if valid.any():
-        vis[valid] = np.clip(depth_mm[valid], lo, hi)
+	# Clamp to [lo,hi] only on valid pixels
+	vis = np.zeros_like(depth_mm, dtype=np.float32)
+	if valid.any():
+		vis[valid] = np.clip(depth_mm[valid], lo, hi)
 
-    vis_u8 = np.zeros_like(depth_u16, dtype=np.uint8)
-    rng = (hi - lo)
-    if rng > 1e-6 and valid.any():
-        vis_u8[valid] = np.round(255.0 * (vis[valid] - lo) / rng).astype(np.uint8)
+	vis_u8 = np.zeros_like(depth_u16, dtype=np.uint8)
+	rng = (hi - lo)
+	if rng > 1e-6 and valid.any():
+		vis_u8[valid] = np.round(255.0 * (vis[valid] - lo) / rng).astype(np.uint8)
 
-    vis_bgr = cv2.applyColorMap(vis_u8, cv2.COLORMAP_JET)
+	vis_bgr = cv2.applyColorMap(vis_u8, cv2.COLORMAP_JET)
 
-    # Make invalid pixels black (optional but helpful)
-    if valid.any():
-        vis_bgr[~valid] = (0, 0, 0)
+	# Make invalid pixels black (optional but helpful)
+	if valid.any():
+		vis_bgr[~valid] = (0, 0, 0)
 
-    return vis_bgr
+	return vis_bgr
 
 
 
@@ -481,6 +493,7 @@ class CameraWorker(QtCore.QThread):
 		self.pipeline = None
 		self.depth_scale = 0.001
 		self.intrinsics = None
+		self.color_intrinsics = None
 		self.has_rgb = False
 
 		# EKF & detection state
@@ -569,6 +582,15 @@ class CameraWorker(QtCore.QThread):
 					self.intrinsics = None
 			except Exception:
 				self.intrinsics = None
+			
+			try:
+				if want_rgb:
+					color_profile = profile.get_stream(rs.stream.color)
+					self.color_intrinsics = color_profile.as_video_stream_profile().get_intrinsics()
+				else:
+					self.color_intrinsics = None
+			except Exception:
+				self.color_intrinsics = None
 
 			self.pc = rs.pointcloud() if (want_depth and self.enable_pointcloud) else None
 
@@ -785,6 +807,7 @@ class CameraWorker(QtCore.QThread):
 
 			# Assemble display frame depending on mode
 			show_bgr = None
+
 			if self.view_mode == "Fast":
 				depth_u16 = np.asanyarray(depth_frame.get_data())
 				h, w = depth_u16.shape
@@ -795,51 +818,89 @@ class CameraWorker(QtCore.QThread):
 					continue
 				h, w = depth_u16.shape
 
-				if self.colour_roi:
-					# Grey+Green path (no JET)
+				cloud = self._last_cloud
+				if cloud is None and self.colour_roi:
 					try:
-						show_bgr = self._render_interest_region(depth_u16, base_bgr=None)
+						pc_local = rs.pointcloud()
+						points = pc_local.calculate(depth_frame)
+						v = np.asanyarray(points.get_vertices())
+						cloud = np.asarray(v.tolist()).reshape(-1, 3)
+						m = np.isfinite(cloud).all(axis=1) & (cloud[:, 2] > 0)
+						cloud = cloud[m]
 					except Exception:
-						# fall back to plain grey if something surprises us
-						grey = cv2.normalize(depth_u16, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-						show_bgr = cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
+						cloud = None
+
+				depth = self._render_interest_region_from_cloud(depth_u16, self.intrinsics, cloud) \
+						if self.colour_roi else colourise_depth(depth_u16, self.depth_scale)
+
+				po = self.plane_overlay
+				if po and (self.draw_table_plane or self.draw_interest_region):
+					show_bgr = overlay_plane_and_roi_on_bgr_po(
+						depth, self.intrinsics, po,
+						self.roi_y_min, self.roi_y_max,
+						self.roi_x_extend, self.roi_z_extend,
+						self.roi_mirror_x, self.roi_mirror_z,
+						self.draw_table_plane, self.draw_interest_region)
 				else:
-					# Normal JET + overlays path
-					depth = colourise_depth(depth_u16, self.depth_scale)
-					try:
-						depth = self._overlay_plane_on_depth(depth)
-					except Exception:
-						pass
-					try:
-						show_bgr = self._render_interest_region(depth_u16, base_bgr=depth)
-					except Exception:
-						show_bgr = depth
+					show_bgr = depth
 
 			elif self.view_mode == "Both":
 				depth_u16 = self._as_np(depth_frame)
-				h, w = depth_u16.shape
+				if depth_u16 is None:
+					continue
 
-				if self.colour_roi:
-					# Left half is grey+green; right half is camera RGB
-					d = self._render_interest_region(depth_u16, base_bgr=None)
-				else:
-					depth = colourise_depth(depth_u16, self.depth_scale)
+				cloud = self._last_cloud
+				if cloud is None and self.colour_roi:
 					try:
-						depth = self._overlay_plane_on_depth(depth)
+						pc_local = rs.pointcloud()
+						points = pc_local.calculate(depth_frame)
+						v = np.asanyarray(points.get_vertices())
+						cloud = np.asarray(v.tolist()).reshape(-1, 3)
+						m = np.isfinite(cloud).all(axis=1) & (cloud[:, 2] > 0)
+						cloud = cloud[m]
 					except Exception:
-						pass
-					d = self._render_interest_region(depth_u16, base_bgr=depth)
+						cloud = None
 
+				depth_img = self._render_interest_region_from_cloud(depth_u16, self.intrinsics, cloud) \
+							if self.colour_roi else colourise_depth(depth_u16, self.depth_scale)
+
+				po = self.plane_overlay
+				if po and (self.draw_table_plane or self.draw_interest_region):
+					d = overlay_plane_and_roi_on_bgr_po(depth_img, self.intrinsics, po, self.roi_y_min, self.roi_y_max,
+													self.roi_x_extend, self.roi_z_extend, self.roi_mirror_x, self.roi_mirror_z, self.draw_table_plane, self.draw_interest_region)
+				else:
+					d = depth_img
+
+				c = None
 				if self._valid_frame(colour_frame):
-					c = self._as_np(colour_frame)
-					show_bgr = np.hstack([d, c]) if d is not None else c
+					c_raw = self._as_np(colour_frame)
+					if c_raw is not None:
+						if po and (self.draw_table_plane or self.draw_interest_region) and self.color_intrinsics is not None:
+							c = overlay_plane_and_roi_on_bgr_po(c_raw, self.color_intrinsics, po,self.roi_y_min, self.roi_y_max,
+													self.roi_x_extend, self.roi_z_extend, self.roi_mirror_x, self.roi_mirror_z, self.draw_table_plane, self.draw_interest_region)
+						else:
+							c = c_raw
+
+				show_bgr = np.hstack([d, c]) if (d is not None and c is not None) else (d if d is not None else c)
 
 			elif self.view_mode == "RGB" and self._valid_frame(colour_frame):
-				c = self._as_np(colour_frame)
-				if c is None:
+				c_raw = self._as_np(colour_frame)
+				if c_raw is None:
 					continue
+				po = self.plane_overlay
+				if po and (self.draw_table_plane or self.draw_interest_region) and self.color_intrinsics is not None:
+					c = overlay_plane_and_roi_on_bgr_po(
+						c_raw, self.color_intrinsics, po,
+						self.roi_y_min, self.roi_y_max,
+						self.roi_x_extend, self.roi_z_extend,
+						self.roi_mirror_x, self.roi_mirror_z,
+						self.draw_table_plane, self.draw_interest_region, 0.25
+					)
+				else:
+					c = c_raw
 				h, w = c.shape[:2]
 				show_bgr = c.copy()
+
 
 
 			# If RGB only, no tracking
@@ -1033,8 +1094,8 @@ class CameraWorker(QtCore.QThread):
 				self.pc = None
 		if not self.enable_pointcloud:
 			self.pc = None
-			with self._cloud_lock:
-				self._last_cloud = None
+			# with self._cloud_lock:
+			# 	self._last_cloud = None
 
 	def _plane_cam_vectors(self):
 		po = self.plane_overlay
@@ -1090,56 +1151,26 @@ class CameraWorker(QtCore.QThread):
 
 		return img_bgr
 
-
 	def _overlay_plane_on_depth(self, depth_bgr):
 		try:
 			if depth_bgr is None or self.intrinsics is None:
 				return depth_bgr
-
 			po = self.plane_overlay
 			if not po or not self.draw_table_plane:
 				return depth_bgr
 
-			# plane in *scene-flipped* space (as per your current pipeline)
-			p0 = np.asarray(po["p0"], float).reshape(3)
-			u  = np.asarray(po["u"],  float).reshape(3)
-			v  = np.asarray(po["v"],  float).reshape(3)
-			w  = float(po.get("width_m", 0.7))
-			l  = float(po.get("length_m", 0.7))
-
-			p0p = p0.copy(); up = u.copy(); vp = v.copy()
-
-			hx, hz = 0.5*w, 0.5*l
-			corners_3d = np.array([
-				p0p + (-hx)*up + (-hz)*vp,
-				p0p + ( hx)*up + (-hz)*vp,
-				p0p + ( hx)*up + ( hz)*vp,
-				p0p + (-hx)*up + ( hz)*vp,
-			], dtype=float)
-
-			# 3D→pixel projection
-			pts = [rs.rs2_project_point_to_pixel(self.intrinsics, c.astype(float).tolist())
-				for c in corners_3d]
-			poly = np.array([[int(p[0]), int(p[1])] for p in pts], dtype=np.int32)
-
-			# clamp to image
+			poly = plane_poly_px_from_overlay(po, self.intrinsics)  # (4,2) int32
 			h, wimg = depth_bgr.shape[:2]
 			poly[:,0] = np.clip(poly[:,0], 0, wimg-1)
 			poly[:,1] = np.clip(poly[:,1], 0, h-1)
 
 			out = depth_bgr.copy()
 			overlay = depth_bgr.copy()
-
-			# fill (low alpha)
 			cv2.fillPoly(overlay, [poly], color=(200, 255, 255), lineType=cv2.LINE_AA)
 			out = cv2.addWeighted(overlay, 0.15, out, 0.85, 0.0)
-
-			# edge (higher alpha look = solid polyline)
-			cv2.polylines(out, [poly], isClosed=True, color=(200, 255, 255),
-						thickness=2, lineType=cv2.LINE_AA)
+			cv2.polylines(out, [poly], isClosed=True, color=(200, 255, 255), thickness=2, lineType=cv2.LINE_AA)
 			return out
 		except Exception:
-			# fail safe: return the input frame untouched
 			return depth_bgr
 	
 	def _roi_corners_3d(self, p0, u, v, w, l):
@@ -1181,88 +1212,208 @@ class CameraWorker(QtCore.QThread):
 			for c in corners_3d]
 		return np.array([[int(p[0]), int(p[1])] for p in pts], np.int32), corners_3d
 	
+	# def _render_interest_region(self, depth_u16, base_bgr=None):
 
-	def _render_interest_region(self, depth_u16, base_bgr=None):
+	# 	po = self.plane_overlay
+	# 	if (self.intrinsics is None) or (po is None):
+	# 		return base_bgr if base_bgr is not None else None
 
-		po = self.plane_overlay
-		if (self.intrinsics is None) or (po is None):
-			return base_bgr if base_bgr is not None else None
+	# 	# Plane basis
+	# 	p0 = np.asarray(po["p0"], float)
+	# 	u  = np.asarray(po["u"],  float); u /= (np.linalg.norm(u)+1e-12)
+	# 	v  = np.asarray(po["v"],  float); v /= (np.linalg.norm(v)+1e-12)
+	# 	n = np.asarray(po["normal"], float)
+	# 	w  = float(po.get("width_m", 0.7))
+	# 	l  = float(po.get("length_m", 0.7))
 
-		# Plane basis
-		p0 = np.asarray(po["p0"], float)
-		u  = np.asarray(po["u"],  float); u /= (np.linalg.norm(u)+1e-12)
-		v  = np.asarray(po["v"],  float); v /= (np.linalg.norm(v)+1e-12)
-		n  = np.cross(u, v);       n /= (np.linalg.norm(n)+1e-12)
-		w  = float(po.get("width_m", 0.7))
-		l  = float(po.get("length_m", 0.7))
+	# 	# Height band relative to plane (meters)
+	# 	hmin = float(self.roi_y_min)
+	# 	hmax = float(self.roi_y_max)
 
-		# Height band relative to plane (meters)
-		hmin = float(self.roi_y_min)
-		hmax = float(self.roi_y_max)
+	# 	# Prepare the background image
+	# 	if self.colour_roi:
+	# 		# Grey from depth_u16 (simple linear map on valid pixels)
+	# 		depth_mm = depth_u16.astype(np.float32) * (self.depth_scale * 1000.0)
+	# 		valid = depth_u16 > 0
+	# 		if valid.any():
+	# 			lo = float(np.percentile(depth_mm[valid], 2))
+	# 			hi = float(np.percentile(depth_mm[valid], 98))
+	# 			if hi <= lo: lo, hi = 400.0, 3000.0
+	# 		else:
+	# 			lo, hi = 400.0, 3000.0
 
-		# Prepare the background image
+	# 		norm = np.zeros_like(depth_mm, np.float32)
+	# 		if valid.any():
+	# 			norm[valid] = np.clip((depth_mm[valid] - lo) / (hi - lo + 1e-6), 0, 1)
+	# 		grey_u8 = (norm * 255.0).astype(np.uint8)
+	# 		out = cv2.cvtColor(grey_u8, cv2.COLOR_GRAY2BGR)
+	# 		out[~valid] = (0,0,0)
+	# 	else:
+	# 		# Use whatever was already composed (e.g., JET + plane polygon)
+	# 		out = base_bgr.copy() if base_bgr is not None else None
+	# 		if out is None:
+	# 			# fallback to a quick JET if none provided
+	# 			out = colourise_depth(depth_u16, self.depth_scale)
+
+		
+	# 	h_img, w_img = depth_u16.shape
+	# 	poly_px = roi_footprint_poly_px_from_overlay(
+	# 		p0=p0, u=u, v=v, n=n,  # flipped only if you want image-layout-consistency
+	# 		width_m=w, length_m=l,
+	# 		x_extend=self.roi_x_extend, z_extend=self.roi_z_extend,
+	# 		mirror_x=self.roi_mirror_x, mirror_z=self.roi_mirror_z,
+	# 		intr=self.intrinsics
+	# 	)
+	# 	poly_px = clip_poly_points_to_image(poly_px, w_img, h_img)
+	# 	mask = np.zeros((h_img, w_img), np.uint8)
+	# 	cv2.fillPoly(mask, [poly_px], 255)
+
+	# 	# Vectorised deprojection only for masked pixels
+	# 	ys, xs = np.nonzero(mask)
+	# 	if xs.size > 0:
+	# 		fx, fy = self.intrinsics.fx, self.intrinsics.fy
+	# 		cx, cy = self.intrinsics.ppx, self.intrinsics.ppy
+	# 		z_m = depth_u16[ys, xs].astype(np.float32) * self.depth_scale
+	# 		valid = z_m > 0
+	# 		if np.any(valid):
+	# 			xs = xs[valid]; ys = ys[valid]; z_m = z_m[valid]
+	# 			X = (xs - cx) * z_m / fx
+	# 			Y = (ys - cy) * z_m / fy
+	# 			Z = z_m
+	# 			P = np.stack([X, Y, Z], axis=1)
+
+	# 			# height above plane: h = n·(P - p0)
+	# 			h = (P - p0[None, :]) @ n
+	# 			in_band = (h >= hmin) & (h <= hmax)
+
+	# 			if self.colour_roi:
+	# 				# Bright green for in-band pixels; background stays grey
+	# 				out[ys[in_band], xs[in_band]] = (0, 255, 80)
+	# 			else:
+	# 				# Optional light tint inside band (comment out to keep pure JET)
+	# 				pass
+
+	# 	return out
+
+	def _render_interest_region_from_cloud(self, depth_u16, intr, xyz_full):
+
+		# Basic guards
+		if depth_u16 is None or intr is None or xyz_full is None or xyz_full.size == 0:
+			return colourise_depth(depth_u16, self.depth_scale)
+
+		# --- Background image: always make BGR ---
 		if self.colour_roi:
-			# Grey from depth_u16 (simple linear map on valid pixels)
+			# fast greyscale from depth (mm), then to BGR
 			depth_mm = depth_u16.astype(np.float32) * (self.depth_scale * 1000.0)
 			valid = depth_u16 > 0
 			if valid.any():
 				lo = float(np.percentile(depth_mm[valid], 2))
 				hi = float(np.percentile(depth_mm[valid], 98))
-				if hi <= lo: lo, hi = 400.0, 3000.0
+				if hi <= lo:
+					lo, hi = 400.0, 3000.0
 			else:
 				lo, hi = 400.0, 3000.0
-
 			norm = np.zeros_like(depth_mm, np.float32)
 			if valid.any():
 				norm[valid] = np.clip((depth_mm[valid] - lo) / (hi - lo + 1e-6), 0, 1)
 			grey_u8 = (norm * 255.0).astype(np.uint8)
 			out = cv2.cvtColor(grey_u8, cv2.COLOR_GRAY2BGR)
-			out[~valid] = (0,0,0)
+			out[~valid] = (0, 0, 0)
 		else:
-			# Use whatever was already composed (e.g., JET + plane polygon)
-			out = base_bgr.copy() if base_bgr is not None else None
-			if out is None:
-				# fallback to a quick JET if none provided
-				out = colourise_depth(depth_u16, self.depth_scale)
+			# fallback to standard colourised depth
+			out = colourise_depth(depth_u16, self.depth_scale)
 
-		# Build ROI mask in image (project polygon from plane) – we reuse the extended rectangle on plane.
-		poly_px, base_corners_3d = self._roi_polygon_px(p0, u, v, w, l)
-		h_img, w_img = depth_u16.shape
-		mask = np.zeros((h_img, w_img), np.uint8)
-		cv2.fillPoly(mask, [poly_px], 255)
+		h, w = out.shape[:2]
 
-		# Vectorised deprojection only for masked pixels
-		ys, xs = np.nonzero(mask)
-		if xs.size > 0:
-			fx, fy = self.intrinsics.fx, self.intrinsics.fy
-			cx, cy = self.intrinsics.ppx, self.intrinsics.ppy
-			z_m = depth_u16[ys, xs].astype(np.float32) * self.depth_scale
-			valid = z_m > 0
-			if np.any(valid):
-				xs = xs[valid]; ys = ys[valid]; z_m = z_m[valid]
-				X = (xs - cx) * z_m / fx
-				Y = (ys - cy) * z_m / fy
-				Z = z_m
-				P = np.stack([X, Y, Z], axis=1)
+		# --- Plane/ROI params (canonical world frame; DO NOT invert normal here) ---
+		po = self.plane_overlay
+		if not po:
+			return out
+		p0 = np.asarray(po["p0"], float)
+		u  = np.asarray(po["u"],  float)
+		v  = np.asarray(po["v"],  float)
+		n  = np.asarray(po["normal"], float)
 
-				# height above plane: h = n·(P - p0)
-				h = (P - p0[None, :]) @ n
-				in_band = (h >= hmin) & (h <= hmax)
+		width_m  = float(po.get("width_m",  0.7))
+		length_m = float(po.get("length_m", 0.7))
 
-				if self.colour_roi:
-					# Bright green for in-band pixels; background stays grey
-					out[ys[in_band], xs[in_band]] = (0, 255, 80)
-				else:
-					# Optional light tint inside band (comment out to keep pure JET)
-					pass
+		# --- World-space ROI mask over full cloud ---
+		inside_full = roi_mask_points_world(
+			xyz_full, p0, u, v, n,
+			width_m, length_m,
+			self.roi_y_min, self.roi_y_max,
+			self.roi_x_extend, self.roi_z_extend,
+			self.roi_mirror_x, self.roi_mirror_z
+		)
+		if not inside_full.any():
+			return out
 
-		# Draw the FULL 3D box if required
-		if self.draw_interest_region and out is not None:
-			verts3d = self._roi_box_vertices_3d(p0, u, v, n, w, l, hmin, hmax)
-			out = self._draw_roi_box_edges(out, verts3d, thickness=2)
+		pts_in = xyz_full[inside_full]
+
+		# --- Project those ROI points to depth pixels (skip behind camera) ---
+		px, valid = project_points_px_masked(pts_in, intr)
+		px = px[valid]
+		if px.size == 0:
+			return out
+
+		# Build/clean a pixel mask
+		xs = np.clip(px[:, 0], 0, w - 1)
+		ys = np.clip(px[:, 1], 0, h - 1)
+		mask = np.zeros((h, w), np.uint8)
+		mask[ys, xs] = 255
+		k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+		mask = cv2.dilate(mask, k, iterations=1)
+		mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+
+		# --- Green overlay (alpha blend) ---
+		overlay = out.copy()
+		overlay[mask > 0] = (0, 255, 0)
+		out = cv2.addWeighted(overlay, 0.35, out, 0.65, 0.0)
 
 		return out
+	
 
+	def _overlay_plane_and_roi_on_image(self, bgr: np.ndarray, intr, plane_overlay: dict, *, fill_alpha_rgb: bool=False) -> np.ndarray:
+		"""
+		Draw plane (filled poly + outline) and ROI wireframe on an image.
+		- fill_alpha_rgb=True -> use low alpha fill (intended for RGB); depth path can keep it too.
+		- ROI normal is inverted here for image overlays (requested behavior).
+		"""
+		if bgr is None or intr is None or not plane_overlay:
+			return bgr
+		out = bgr.copy()
+		h, w = out.shape[:2]
+
+		p0 = np.asarray(plane_overlay["p0"], float)
+		u  = np.asarray(plane_overlay["u"],  float)
+		v  = np.asarray(plane_overlay["v"],  float)
+		w_m  = float(plane_overlay.get("width_m", 0.7))
+		l_m  = float(plane_overlay.get("length_m", 0.7))
+		n = np.asarray(plane_overlay["normal"], float)
+	
+		# plane polygon
+		if self.draw_table_plane:
+			poly = plane_poly_px_from_overlay(p0=p0, u=u, v=v, width_m=w_m, length_m=l_m, intr=intr)
+			poly = clip_poly_points_to_image(poly, w, h)
+			if fill_alpha_rgb:
+				ov = out.copy()
+				cv2.fillPoly(ov, [poly], color=(200,255,255), lineType=cv2.LINE_AA)
+				out = cv2.addWeighted(ov, 0.15, out, 0.85, 0.0)
+			cv2.polylines(out, [poly], True, (200,255,255), 2, lineType=cv2.LINE_AA)
+
+		# ROI wireframe (clipped)
+		if self.draw_interest_region:
+			segs = roi_box_edges_px_from_overlay_clipped(
+				p0=p0, u=u, v=v, n=n, width_m=w_m, length_m=l_m, intr=intr,
+				y_min=self.roi_y_min, y_max=self.roi_y_max,
+				x_extend=self.roi_x_extend, z_extend=self.roi_z_extend,
+				mirror_x=self.roi_mirror_x, mirror_z=self.roi_mirror_z,
+				image_shape=out.shape
+			)
+			for (x0,y0),(x1,y1) in segs:
+				cv2.line(out, (x0,y0), (x1,y1), (180,180,180), 2, lineType=cv2.LINE_AA)
+
+		return out
 
 # ==================================================================
 
@@ -1297,10 +1448,6 @@ class MainWindow(QtWidgets.QMainWindow):
 		live_layout.setContentsMargins(0,0,0,0)
 		live_layout.addWidget(self.video)
 		self.stack.addWidget(live_page)   # index 0
-
-		# self.video.setScaledContents(False)
-		# self.video.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
-		# self.video.setMinimumSize(1, 1) 
 		self._video_target_size = QtCore.QSize()
 
 		# Page 1: Review
@@ -1410,6 +1557,9 @@ class MainWindow(QtWidgets.QMainWindow):
 			self.worker.draw_interest_region = self.chk_draw_roi.isChecked()
 			self.worker.colour_roi = self.chk_colour_roi.isChecked()
 
+			if self.worker.colour_roi:
+				self.worker.set_enable_pointcloud(True)
+
 		self.chk_draw_plane.toggled.connect(_apply_overlay_toggles)
 		self.chk_draw_roi.toggled.connect(_apply_overlay_toggles)
 		self.chk_colour_roi.toggled.connect(_apply_overlay_toggles)
@@ -1486,6 +1636,7 @@ class MainWindow(QtWidgets.QMainWindow):
 				"p0": pl.get("p0", [0,0,1]),
 				"u":  pl.get("u",  [1,0,0]),
 				"v":  pl.get("v",  [0,0,1]),
+				"normal": pl.get("normal", [1,0,0]),
 				"width_m":  float(pl.get("width_m", 0.7)),
 				"length_m": float(pl.get("length_m", 0.7)),
 				"visible":  bool(pl.get("visible", visible)),
