@@ -15,6 +15,7 @@ import pyrealsense2 as rs
 
 from Ball_Tracking.review_wizard import ReviewPage, VideoLabel, qimage_from_bgr
 from Ball_Tracking.plane_wizard import PlaneSetupWizard, TablePlane
+from Ball_Tracking.graphics_objects import AspectImageView
 
 try:
 	from Communications.ipc import ControlListener, InterceptPublisher
@@ -63,6 +64,10 @@ B_LOGO_PATH  = "Assets/BULLSEYE.png"
 W_LOGO_PATH  = "Assets/BULLSEYE_W.png"
 FAST_IM = "Assets/FAST_MODE.png"
 SEARCH_IM = "Assets/SEARCHING.png"
+PLANE_W = "Assets/PLANE_W.png"
+PLAY_W = "Assets/PLAY_W.png"
+WIZARD_W = "Assets/WIZARD_W.png"
+
 # ============================================================
 
 
@@ -407,6 +412,7 @@ class CameraWorker(QtCore.QThread):
 	event = QtCore.pyqtSignal(str)              # log events
 	camera_ok = QtCore.pyqtSignal(bool)         # camera connection
 	fast_ok = QtCore.pyqtSignal(bool)         	# fast connection
+	rgb_for_wizard = QtCore.pyqtSignal(QtGui.QImage)
 
 	def __init__(self, parent=None):
 		super().__init__(parent)
@@ -454,9 +460,9 @@ class CameraWorker(QtCore.QThread):
 		self.display_hz = 25.0      # UI refresh cap (Hz)
 		self._last_emit_ts = 0.0
 
-		self.draw_interest_region = True
+		self.draw_interest_region = False
 		self.draw_table_plane = True
-		self.colour_roi = True
+		self.colour_roi = False
 
 		self.plane_overlay = None   # dict with keys: p0,u,v,width_m,length_m,visible,invert_y
 		self.plane_n = np.array(PLANE_NORMAL, float).reshape(3)
@@ -504,6 +510,12 @@ class CameraWorker(QtCore.QThread):
 		except Exception:
 			pass
 		self.serial_sender = InterceptSender(self.send_to_arduino, SERIAL_PORT, SERIAL_BAUD)
+	
+	def _qimage_from_bgr(self, bgr: np.ndarray):
+		# bgr is HxWx3 uint8
+		rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+		h, w, _ = rgb.shape
+		return QtGui.QImage(rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888).copy()
 
 	def set_crop(self, top, bottom, left, right):
 		self.crop_top, self.crop_bottom = float(top), float(bottom)
@@ -857,6 +869,14 @@ class CameraWorker(QtCore.QThread):
 								self._last_cloud = xyz
 						except Exception:
 							pass
+					if self._valid_frame(colour_frame):
+						c = self._as_np(colour_frame)
+						if c is not None:
+							try:
+								self.rgb_for_wizard.emit(self._qimage_from_bgr(c))
+							except Exception:
+								pass
+
 
 				# ===== Tracking =====
 				if not self.detected:
@@ -1271,12 +1291,17 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.worker.camera_ok.connect(self.on_camera_ok)
 
 		# Page 0: Live
-		self.video = VideoLabel()
+		self.video = AspectImageView(self)
 		live_page = QtWidgets.QWidget()
 		live_layout = QtWidgets.QVBoxLayout(live_page)
 		live_layout.setContentsMargins(0,0,0,0)
 		live_layout.addWidget(self.video)
 		self.stack.addWidget(live_page)   # index 0
+
+		# self.video.setScaledContents(False)
+		# self.video.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
+		# self.video.setMinimumSize(1, 1) 
+		self._video_target_size = QtCore.QSize()
 
 		# Page 1: Review
 		self.review_page = ReviewPage()
@@ -1306,11 +1331,6 @@ class MainWindow(QtWidgets.QMainWindow):
 		root.setSpacing(12)
 
 		# Header title
-		header = QtWidgets.QHBoxLayout()
-		title = QtWidgets.QLabel("D  E  A  D  S  H  T")   # logo where O would be
-		title.setObjectName("titleLabel")
-		header.addWidget(title, 1)
-
 		# Insert the small logo instead of “O”
 		if os.path.exists(W_LOGO_PATH):
 			small_logo = QtWidgets.QLabel()
@@ -1325,9 +1345,9 @@ class MainWindow(QtWidgets.QMainWindow):
 			spaced.addWidget(small_logo, 1, QtCore.Qt.AlignCenter) 
 			lbl_t = QtWidgets.QLabel("T"); lbl_t.setObjectName("titleLabel")
 			spaced.addWidget(lbl_t, 1, QtCore.Qt.AlignCenter)
-			header = spaced
+			# header = spaced
 
-		root.addLayout(header)
+		root.addLayout(spaced)
 
 		# --- Camera status + streams/fast card ---
 		self.cam_status = QtWidgets.QLabel("Camera: …")
@@ -1363,8 +1383,8 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.rec_chk = QtWidgets.QCheckBox("Enable Recording")
 		self.rec_chk.setChecked(False)
 
-		self.btn_load_review = QtWidgets.QPushButton("Review Wizard")
-		self.btn_plane = QtWidgets.QPushButton("Plane Wizard")
+		self.btn_load_review = QtWidgets.QPushButton("REVIEW WIZARD")
+		self.btn_plane = QtWidgets.QPushButton("PLANE WIZARD")
 
 		card_send = make_card(self.send_chk, self.rec_chk, self.btn_load_review, self.btn_plane)
 		root.addWidget(card_send)
@@ -1524,13 +1544,18 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.worker.start()
 
 	def _enter_plane_setup(self):
+		# keep what you already have
 		self.worker.set_enable_pointcloud(True)
-		# speed up cloud while in wizard
 		self._prev_cloud_stride = self.worker._cloud_stride
 		self._prev_cloud_every  = self.worker._cloud_every
 		self.worker._cloud_stride = 2
 		self.worker._cloud_every  = 1
 
+		self.worker.req_depth = True; self.worker.req_rgb = True; self.worker.req_fast = False
+		self.chk_depth.setChecked(True); self.chk_rgb.setChecked(True); self.chk_fast.setChecked(False)
+		self.worker.request_reconfig(True, True, False)  # depth, rgb, fast
+
+		# existing
 		self.plane_setup._set_worker(self.worker)
 		self.findChild(QtWidgets.QDockWidget, "rightDock").hide()
 		self.stack.setCurrentWidget(self.plane_setup)
@@ -1556,7 +1581,6 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.worker.search_box = box
 		self.stack.setCurrentIndex(0)
 		self.findChild(QtWidgets.QDockWidget, "rightDock").show()
-
 
 	def _wire_worker_signals(self):
 		self.worker.frame.connect(self.on_frame)
@@ -1596,6 +1620,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
 		# Request reconfigure in the worker thread
 		self.worker.request_reconfig(want_depth, want_rgb, want_fast)
+	
+	def resizeEvent(self, ev: QtGui.QResizeEvent):
+		super().resizeEvent(ev)
+		# Recompute the target drawing size only when the window/layout actually changes
+		self._video_target_size = self.video.size()
+
+	@QtCore.pyqtSlot(QtGui.QImage)
+	def on_frame(self, qimg: QtGui.QImage):
+		# Just hand it to the view; it will repaint to current widget size
+		self.video.setImage(qimg)
 
 	# ---------- Live updates ----------
 	@QtCore.pyqtSlot(QtGui.QImage)

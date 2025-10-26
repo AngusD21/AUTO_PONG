@@ -6,13 +6,18 @@ import cv2
 import serial
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from pyqtgraph.exporters import ImageExporter
 import pyrealsense2 as rs
 
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
-from Ball_Tracking.graphics_objects import  CollapsibleCard, RangeSlider, AxisGlyph, AXIS_COLORS
+from Ball_Tracking.graphics_objects import  AspectImageView, CollapsibleCard, RangeSlider, AxisGlyph, AXIS_COLORS
 from Ball_Tracking.graphics_objects import  _backing_spin, _colored_span, _link_half_to_span, _link_span_to_half,make_full_slider_row, _span_box
+
+PLANE_W = "Assets/PLANE_W.png"
+PLAY_W = "Assets/PLAY_W.png"
+WIZARD_W = "Assets/WIZARD_W.png"
 
 #======================= PLANE OBJECT =========================
 @dataclass
@@ -64,37 +69,40 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		self._pl_yaw = 0.0
 		self._pl_pitch = 0.0
 		self._pl_roll = 0.0
+		
+		self.flip_u = False
+		self.flip_v = False
+		self.flip_n = False
 
 		# Layout: GL on the left, controls on the right
 		root = QtWidgets.QHBoxLayout(self)
 		root.setContentsMargins(8,8,8,8)
 		root.setSpacing(8)
 
-		# ---------- Left panel (GL) ----------
-		if 1: 
+		# ---------- 3D Tab ----------
+		if 1:
+			self.leftTabs = QtWidgets.QTabWidget()
+			self.leftTabs.setTabPosition(QtWidgets.QTabWidget.North)
+			self.leftTabs.setDocumentMode(True)
+			root.addWidget(self.leftTabs, 1)
+
+			# --- Tab 1: 3D (existing GL + HUD) ---
+			tab3d = QtWidgets.QWidget()
+			t3d_v = QtWidgets.QVBoxLayout(tab3d); t3d_v.setContentsMargins(0,0,0,0); t3d_v.setSpacing(6)
+
 			self.gl = gl.GLViewWidget()
 			self.gl.opts['distance'] = 2.0
 			self.gl.setBackgroundColor((10,10,12))
 			self.gl.installEventFilter(self)
-			# root.addWidget(self.gl, 1)
+			t3d_v.addWidget(self.gl, 1)
 
-			# left column with GL on top and axis HUD at bottom
-			left_col = QtWidgets.QWidget()
-			left_v = QtWidgets.QVBoxLayout(left_col)
-			left_v.setContentsMargins(0,0,0,0); left_v.setSpacing(6)
-			left_v.addWidget(self.gl, 1)
-
-			# axis HUD row
 			hud = QtWidgets.QWidget()
 			hud_h = QtWidgets.QHBoxLayout(hud); hud_h.setContentsMargins(0,0,0,0); hud_h.setSpacing(8)
 			self.glyph_cam  = AxisGlyph("Camera")
 			self.glyph_box  = AxisGlyph("Box")
 			self.glyph_plane= AxisGlyph("Plane")
 			hud_h.addWidget(self.glyph_cam); hud_h.addWidget(self.glyph_box); hud_h.addWidget(self.glyph_plane)
-			left_v.addWidget(hud, 0)
-
-			root.addWidget(left_col, 1)
-
+			t3d_v.addWidget(hud, 0)
 			# Start in a pose that’s behind/above the camera looking down +Z
 			self.gl.opts['fov'] = 45
 			self._set_default_view()
@@ -144,6 +152,85 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 								self.cam_mesh, self.cam_forward):
 					it.scale(1.0, -1.0, 1.0)
 
+			self.leftTabs.addTab(tab3d, "3D")
+
+		# Camera Tab
+		if 1:
+			tabCam = QtWidgets.QWidget()
+			tcam_v = QtWidgets.QVBoxLayout(tabCam); tcam_v.setContentsMargins(0,0,0,0)
+			self.camLabel = AspectImageView(self)
+			# self.camLabel.setAlignment(QtCore.Qt.AlignCenter)
+			# self.camLabel.setMinimumHeight(200)
+			# self.camLabel.setStyleSheet("background:#111; color:#888;")
+			tcam_v.addWidget(self.camLabel, 1)
+			self.leftTabs.addTab(tabCam, "Camera")
+
+			self.cam_running = True
+			self.cam_show_plane = False
+			self.cam_show_roi   = False
+			self._last_cam_ts   = 0.0
+			self._cam_interval  = 1.0 / 30.0
+
+		# Planar Tab
+		if 1:
+			tab2d = QtWidgets.QWidget()
+			t2d_v = QtWidgets.QVBoxLayout(tab2d); t2d_v.setContentsMargins(0,0,0,0); t2d_v.setSpacing(6)
+
+			# small tab bar for uv / u-n / v-n
+			self.plane2dTabs = QtWidgets.QTabWidget()
+			t2d_v.addWidget(self.plane2dTabs, 1)
+
+			# U-V
+			w_uv = QtWidgets.QWidget(); l_uv = QtWidgets.QVBoxLayout(w_uv); l_uv.setContentsMargins(4,4,4,4)
+			self.plot_uv = pg.PlotWidget()
+			self.sp_uv = pg.ScatterPlotItem(size=3, pxMode=True)  # 3 px points
+			self.plot_uv.addItem(self.sp_uv)
+			self.plot_uv.setLabel('bottom', 'z (m)'); self.plot_uv.setLabel('left', 'x (m)')
+			self.plane2dTabs.addTab(w_uv, "Top Down")
+			l_uv.addWidget(self.plot_uv)
+
+			# U-N
+			w_un = QtWidgets.QWidget(); l_un = QtWidgets.QVBoxLayout(w_un); l_un.setContentsMargins(4,4,4,4)
+			self.plot_un = pg.PlotWidget()
+			self.sp_un = pg.ScatterPlotItem(size=3, pxMode=True)
+			self.plot_un.addItem(self.sp_un)
+			self.plot_un.setLabel('bottom', 'z (m)'); self.plot_un.setLabel('left', 'y (m)')
+			self.plane2dTabs.addTab(w_un, "Side X")
+			l_un.addWidget(self.plot_un)
+
+			# V-N
+			w_vn = QtWidgets.QWidget(); l_vn = QtWidgets.QVBoxLayout(w_vn); l_vn.setContentsMargins(4,4,4,4)
+			self.plot_vn = pg.PlotWidget()
+			self.sp_vn = pg.ScatterPlotItem(size=3, pxMode=True)
+			self.plot_vn.addItem(self.sp_vn)
+			self.plot_vn.setLabel('bottom', 'x (m)'); self.plot_vn.setLabel('left', 'y (m)')
+			self.plane2dTabs.addTab(w_vn, "Side Z")
+			l_vn.addWidget(self.plot_vn)
+
+			self.leftTabs.addTab(tab2d, "Plane 2D")
+
+			# Overlays
+			self.uv_box = pg.PlotDataItem(pen=pg.mkPen(200, 200, 200, 160), connect='finite')
+			self.uv_roi = pg.PlotDataItem(pen=pg.mkPen(200, 200, 50, 255), connect='finite')
+			self.plot_uv.addItem(self.uv_box); self.plot_uv.addItem(self.uv_roi)
+
+			self.un_box = pg.PlotDataItem(pen=pg.mkPen(200, 200, 200, 160), connect='finite')
+			self.un_roi = pg.PlotDataItem(pen=pg.mkPen(200, 200, 50, 255), connect='finite')
+			self.plot_un.addItem(self.un_box); self.plot_un.addItem(self.un_roi)
+
+			self.vn_box = pg.PlotDataItem(pen=pg.mkPen(200, 200, 200, 160), connect='finite')
+			self.vn_roi = pg.PlotDataItem(pen=pg.mkPen(200, 200, 50, 255), connect='finite')
+			self.plot_vn.addItem(self.vn_box); self.plot_vn.addItem(self.vn_roi)
+
+			# Planes
+			self.uv_plane_poly = pg.PlotDataItem(pen=pg.mkPen(colour=(255, 180, 185, 220), width=3), connect='all')
+			self.un_plane_poly = pg.PlotDataItem(pen=pg.mkPen(colour=(255, 180, 185, 220), width=3), connect='all')
+			self.vn_plane_poly = pg.PlotDataItem(pen=pg.mkPen(colour=(255, 180, 185, 220), width=3), connect='all')
+			self.plot_uv.addItem(self.uv_plane_poly)
+			self.plot_un.addItem(self.un_plane_poly)
+			self.plot_vn.addItem(self.vn_plane_poly)
+
+
 		# ---------- Right panel ----------
 		if 1:
 			panel = QtWidgets.QFrame()
@@ -154,11 +241,18 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			root.addWidget(panel, 0)
 
 			# Title
-			title = QtWidgets.QLabel("PLANE WIZARD")
-			title.setStyleSheet("font-weight:700; font-size:16px;")
-			title.setAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter)
-			title.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-			panel_layout.addWidget(title)
+			if os.path.exists(PLANE_W):
+				small_logo = QtWidgets.QLabel()
+				pm = QtGui.QPixmap(PLANE_W).scaledToHeight(28, QtCore.Qt.SmoothTransformation)
+				small_logo.setPixmap(pm)
+				spaced = QtWidgets.QHBoxLayout()
+				for ch in " PLANE WIZARD ":
+					lbl = QtWidgets.QLabel(ch)
+					lbl.setObjectName("titleLabel")
+					spaced.addWidget(lbl, 1, QtCore.Qt.AlignCenter)
+				spaced.addWidget(small_logo, 1, QtCore.Qt.AlignCenter) 
+				spaced.addWidget(QtWidgets.QLabel(' '), 1, QtCore.Qt.AlignCenter) 
+			panel_layout.addLayout(spaced)
 
 			# Center (m)
 			self.cx = _backing_spin(-10.0, 10.0, 0.001, 0.0)
@@ -169,22 +263,94 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self.ey = _backing_spin(0.01, 1.0, 0.001, 0.05)
 			self.ez = _backing_spin(0.05, 5.0, 0.001, 0.40)
 			# Rotation (deg)
-			self.yaw   = _backing_spin(-180.0, 180.0, 0.5, 0.0)
-			self.pitch = _backing_spin(-180.0, 180.0, 0.5, 0.0)
-			self.roll  = _backing_spin(-180.0, 180.0, 0.5, 0.0)
+			self.yaw   = _backing_spin(-180.0, 180.0, 0.1, 0.0)
+			self.pitch = _backing_spin(-180.0, 180.0, 0.1, 0.0)
+			self.roll  = _backing_spin(-180.0, 180.0, 0.1, 0.0)
+		
+		# Context Row
+		if 1:
+			# Changes per left tab
+			self.contextStack = QtWidgets.QStackedWidget()
+			panel_layout.addWidget(self.contextStack)
 
-			# --- Right sidebar (cards) ---
-			scroll = QtWidgets.QScrollArea()
-			scroll.setWidgetResizable(True)
-			panel_layout.addWidget(scroll, 1)
+			# 3D tab
+			row3d_top = QtWidgets.QWidget()
+			r3_top = QtWidgets.QHBoxLayout(row3d_top); r3_top.setContentsMargins(0,0,0,0); r3_top.setSpacing(6)
+			btnResetView = QtWidgets.QPushButton("Reset View")
+			self.btn_view_u = QtWidgets.QPushButton("<")
+			self.btn_view_v = QtWidgets.QPushButton(">")
+			self.planeVLabel = QtWidgets.QLabel("Plane View"); self.planeVLabel.setAlignment(QtCore.Qt.AlignCenter)
+			r3_top.addWidget(btnResetView); r3_top.addSpacing(20)
+			r3_top.addWidget(self.btn_view_u); r3_top.addWidget(self.planeVLabel); r3_top.addWidget(self.btn_view_v)
 
-			right_host = QtWidgets.QWidget()
-			right = QtWidgets.QVBoxLayout(right_host)
-			right.setContentsMargins(0,0,0,0)
-			right.setSpacing(12)
-			scroll.setWidget(right_host)
+			# build 2 identical bottom rows
+			self.row3d_bot, self.chkDepthColour3D, self.chkPlaneFade3D = self._build_bot_controls_row()
+			self.row2d_bot, self.chkDepthColour2D, self.chkPlaneFade2D = self._build_bot_controls_row()
+			self.chkDepthColour3D.setChecked(True)
+			self.chkPlaneFade3D.setChecked(True)
+			self.chkDepthColour2D.setChecked(True)
+			self.chkPlaneFade2D.setChecked(True)
 
-		# ---------- PLANE ROI CARD ----------
+			def _sync(a, b):
+				a.blockSignals(True); b.blockSignals(True)
+				b.setChecked(a.isChecked())
+				a.blockSignals(False); b.blockSignals(False)
+
+			self.chkDepthColour3D.toggled.connect(lambda _: _sync(self.chkDepthColour3D, self.chkDepthColour2D))
+			self.chkDepthColour2D.toggled.connect(lambda _: _sync(self.chkDepthColour2D, self.chkDepthColour3D))
+			self.chkPlaneFade3D.toggled.connect(lambda _: _sync(self.chkPlaneFade3D, self.chkPlaneFade2D))
+			self.chkPlaneFade2D.toggled.connect(lambda _: _sync(self.chkPlaneFade2D, self.chkPlaneFade3D))
+
+			self.chkDepthColour = self.chkDepthColour3D
+			self.chkPlaneFade   = self.chkPlaneFade3D
+
+			page3d = QtWidgets.QWidget()
+			page3d_v = QtWidgets.QVBoxLayout(page3d); page3d_v.setContentsMargins(0,0,0,0); page3d_v.setSpacing(4)
+			page3d_v.addWidget(row3d_top)
+			page3d_v.addWidget(self.row3d_bot)
+			self.contextStack.addWidget(page3d)
+
+			# wire the top-row buttons
+			btnResetView.clicked.connect(self._set_default_view)
+			self.btn_view_u.clicked.connect(lambda: self._view_from_axis(1))
+			self.btn_view_v.clicked.connect(lambda: self._view_from_axis(-1))
+
+			# Row for Camera tab
+			rowCam = QtWidgets.QWidget(); rc = QtWidgets.QHBoxLayout(rowCam); rc.setContentsMargins(0,0,0,0); rc.setSpacing(6)
+			self.chkCamPlane = QtWidgets.QCheckBox("Display Plane")
+			self.chkCamROI   = QtWidgets.QCheckBox("Display ROI")
+			self.btnCamStart = QtWidgets.QPushButton("Start")
+			self.btnCamStop  = QtWidgets.QPushButton("Stop")
+			self.btnCamSnap  = QtWidgets.QPushButton("Snapshot")
+			rc.addWidget(self.chkCamPlane); rc.addWidget(self.chkCamROI); rc.addStretch(1)
+			rc.addWidget(self.btnCamStart); rc.addWidget(self.btnCamStop); rc.addWidget(self.btnCamSnap)
+			self.contextStack.addWidget(rowCam)
+
+			self.chkCamPlane.toggled.connect(lambda v: setattr(self, "cam_show_plane", bool(v)))
+			self.chkCamROI.toggled.connect(lambda v: setattr(self, "cam_show_roi",   bool(v)))
+
+			self.btnCamStart.clicked.connect(lambda: setattr(self, "cam_running", True))
+			self.btnCamStop.clicked.connect(lambda: setattr(self, "cam_running", False))
+			self.btnCamSnap.clicked.connect(self._snapshot_camera_frame)
+
+			# Plane 2D tab
+			self.contextStack.addWidget(self.row2d_bot)
+
+			# Switch the context row when the left tabs change
+			self.leftTabs.currentChanged.connect(self._on_left_tab_changed)
+
+		# --- Right sidebar (cards) ---
+		scroll = QtWidgets.QScrollArea()
+		scroll.setWidgetResizable(True)
+		panel_layout.addWidget(scroll, 1)
+
+		right_host = QtWidgets.QWidget()
+		right = QtWidgets.QVBoxLayout(right_host)
+		right.setContentsMargins(0,0,0,0)
+		right.setSpacing(12)
+		scroll.setWidget(right_host)
+
+		# ---------- ROI CARD ----------
 		if 1:
 			card_box = CollapsibleCard("SELECT PLANE POINTS")
 			# header full width + centered text
@@ -241,9 +407,9 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			box_layout.addWidget(self.row_cx); box_layout.addWidget(self.row_cy); box_layout.addWidget(self.row_cz)
 
 			# Sliders: Rotation (deg)
-			self.row_yw, self.s_yw, self.sp_yw, i2v_yw, v2i_yw, _ = make_full_slider_row("Yaw",   -180.0, 180.0, 0.5, self.yaw.value(),   "y", "°")
-			self.row_pt, self.s_pt, self.sp_pt, i2v_pt, v2i_pt, _ = make_full_slider_row("Pitch", -180.0, 180.0, 0.5, self.pitch.value(), "x", "°")
-			self.row_rl, self.s_rl, self.sp_rl, i2v_rl, v2i_rl, _ = make_full_slider_row("Roll",  -180.0, 180.0, 0.5, self.roll.value(),  "z", "°")
+			self.row_yw, self.s_yw, self.sp_yw, i2v_yw, v2i_yw, _ = make_full_slider_row("Yaw",   -180.0, 180.0, 0.1, self.yaw.value(),   "y", "°")
+			self.row_pt, self.s_pt, self.sp_pt, i2v_pt, v2i_pt, _ = make_full_slider_row("Pitch", -90.0, 90.0, 0.1, self.pitch.value(), "x", "°")
+			self.row_rl, self.s_rl, self.sp_rl, i2v_rl, v2i_rl, _ = make_full_slider_row("Roll",  -90.0, 90.0, 0.1, self.roll.value(),  "z", "°")
 
 			self.s_yw.valueChanged.connect(lambda i: (self.yaw.setValue(i2v_yw(i)), self._update_box()))
 			self.s_pt.valueChanged.connect(lambda i: (self.pitch.setValue(i2v_pt(i)), self._update_box()))
@@ -257,7 +423,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 
 			box_layout.addWidget(self.row_yw); box_layout.addWidget(self.row_pt); box_layout.addWidget(self.row_rl)
 
-
+			card_box._content.setVisible(False)
 			right.addWidget(card_box)
 		
 		# ---------- PLANE CARD ----------
@@ -286,20 +452,19 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			psp.addWidget(row_w); psp.addWidget(row_l)
 			pln_layout.addWidget(row_psp)
 
-			# Position (local coordinates, along plane axes)
-			pln_layout.addWidget(QtWidgets.QLabel("Plane Center (local)"))
-			row_lx, s_lx, self.sp_lx, i2v_lx, v2i_lx, _ = make_full_slider_row("Local X", -2.0, 2.0, 0.002, 0.0, "x", " m")
-			row_ly, s_ly, self.sp_ly, i2v_ly, v2i_ly, _ = make_full_slider_row("Local Y", -2.0, 2.0, 0.002, 0.0, "y", " m")
-			row_lz, s_lz, self.sp_lz, i2v_lz, v2i_lz, _ = make_full_slider_row("Local Z", -2.0, 2.0, 0.002, 0.0, "z", " m")
+			# Local position (store sliders & mappers)
+			row_lx, self.s_lx, self.sp_lx, self.i2v_lx, self.v2i_lx, _ = make_full_slider_row("Local X", -2.0, 2.0, 0.002, 0.0, "x", " m")
+			row_ly, self.s_ly, self.sp_ly, self.i2v_ly, self.v2i_ly, _ = make_full_slider_row("Local Y", -2.0, 2.0, 0.002, 0.0, "y", " m")
+			row_lz, self.s_lz, self.sp_lz, self.i2v_lz, self.v2i_lz, _ = make_full_slider_row("Local Z", -2.0, 2.0, 0.002, 0.0, "z", " m")
 			pln_layout.addWidget(row_lx); pln_layout.addWidget(row_ly); pln_layout.addWidget(row_lz)
 
-			# Rotation (about plane's local axes)
-			pln_layout.addWidget(QtWidgets.QLabel("Plane Rotation (local)"))
-			row_yw2, s_yw2,self.sp_yw2, i2v_yw2, v2i_yw2, _ = make_full_slider_row("Yaw (about n)",   -180.0, 180.0, 0.5, 0.0, "y", "°")
-			row_pt2, s_pt2,self.sp_pt2, i2v_pt2, v2i_pt2, _ = make_full_slider_row("Pitch (about u)", -89.0,   89.0, 0.5, 0.0, "x", "°")
-			row_rl2, s_rl2,self.sp_rl2, i2v_rl2, v2i_rl2, _ = make_full_slider_row("Roll (about v)",  -89.0,   89.0, 0.5, 0.0, "z", "°")
+			# Local rotations (store sliders & mappers)
+			row_yw2, self.s_yw2, self.sp_yw2, self.i2v_yw2, self.v2i_yw2, _ = make_full_slider_row("Yaw (about n)",   -180.0, 180.0, 0.1, 0.0, "y", "°")
+			row_pt2, self.s_pt2, self.sp_pt2, self.i2v_pt2, self.v2i_pt2, _ = make_full_slider_row("Pitch (about u)",  -89.0,   89.0, 0.1, 0.0, "x", "°")
+			row_rl2, self.s_rl2, self.sp_rl2, self.i2v_rl2, self.v2i_rl2, _ = make_full_slider_row("Roll (about v)",   -89.0,   89.0, 0.1, 0.0, "z", "°")
 			pln_layout.addWidget(row_yw2); pln_layout.addWidget(row_pt2); pln_layout.addWidget(row_rl2)
 
+			card_pln._content.setVisible(False)
 			right.addWidget(card_pln)
 
 			# --- Plane UI wiring ---
@@ -309,34 +474,34 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self.chk_plane_visible.toggled.connect(lambda v: (setattr(self, "pl_visible", bool(v)), self._update_plane_draw()))
 
 			# Local position offsets
-			s_lx.valueChanged.connect(lambda i: (
-				self.sp_lx.blockSignals(True), self.sp_lx.setValue(i2v_lx(i)), self.sp_lx.blockSignals(False),
-				setattr(self, "_pl_off_local", np.array([i2v_lx(i), self._pl_off_local[1], self._pl_off_local[2]])),
+			self.s_lx.valueChanged.connect(lambda i: (
+				self.sp_lx.blockSignals(True), self.sp_lx.setValue(self.i2v_lx(i)), self.sp_lx.blockSignals(False),
+				setattr(self, "_pl_off_local", np.array([self.i2v_lx(i), self._pl_off_local[1], self._pl_off_local[2]])),
 				self._update_plane_from_ui()
 			))
-			s_ly.valueChanged.connect(lambda i: (
-				self.sp_ly.blockSignals(True), self.sp_ly.setValue(i2v_ly(i)), self.sp_ly.blockSignals(False),
-				setattr(self, "_pl_off_local", np.array([self._pl_off_local[0], i2v_ly(i), self._pl_off_local[2]])),
+			self.s_ly.valueChanged.connect(lambda i: (
+				self.sp_ly.blockSignals(True), self.sp_ly.setValue(self.i2v_ly(i)), self.sp_ly.blockSignals(False),
+				setattr(self, "_pl_off_local", np.array([self._pl_off_local[0], self.i2v_ly(i), self._pl_off_local[2]])),
 				self._update_plane_from_ui()
 			))
-			s_lz.valueChanged.connect(lambda i: (
-				self.sp_lz.blockSignals(True), self.sp_lz.setValue(i2v_lz(i)), self.sp_lz.blockSignals(False),
-				setattr(self, "_pl_off_local", np.array([self._pl_off_local[0], self._pl_off_local[1], i2v_lz(i)])),
+			self.s_lz.valueChanged.connect(lambda i: (
+				self.sp_lz.blockSignals(True), self.sp_lz.setValue(self.i2v_lz(i)), self.sp_lz.blockSignals(False),
+				setattr(self, "_pl_off_local", np.array([self._pl_off_local[0], self._pl_off_local[1], self.i2v_lz(i)])),
 				self._update_plane_from_ui()
 			))
 
-			# Local rotations
-			s_yw2.valueChanged.connect(lambda i: (
-				self.sp_yw2.blockSignals(True), self.sp_yw2.setValue(i2v_yw2(i)), self.sp_yw2.blockSignals(False),
-				setattr(self, "_pl_yaw", i2v_yw2(i)), self._update_plane_from_ui()
+			# Local rotations (sliders drive state)
+			self.s_yw2.valueChanged.connect(lambda i: (
+				self.sp_yw2.blockSignals(True), self.sp_yw2.setValue(self.i2v_yw2(i)), self.sp_yw2.blockSignals(False),
+				setattr(self, "_pl_yaw", self.i2v_yw2(i)), self._update_plane_from_ui()
 			))
-			s_pt2.valueChanged.connect(lambda i: (
-				self.sp_pt2.blockSignals(True), self.sp_pt2.setValue(i2v_pt2(i)), self.sp_pt2.blockSignals(False),
-				setattr(self, "_pl_pitch", i2v_pt2(i)), self._update_plane_from_ui()
+			self.s_pt2.valueChanged.connect(lambda i: (
+				self.sp_pt2.blockSignals(True), self.sp_pt2.setValue(self.i2v_pt2(i)), self.sp_pt2.blockSignals(False),
+				setattr(self, "_pl_pitch", self.i2v_pt2(i)), self._update_plane_from_ui()
 			))
-			s_rl2.valueChanged.connect(lambda i: (
-				self.sp_rl2.blockSignals(True), self.sp_rl2.setValue(i2v_rl2(i)), self.sp_rl2.blockSignals(False),
-				setattr(self, "_pl_roll", i2v_rl2(i)), self._update_plane_from_ui()
+			self.s_rl2.valueChanged.connect(lambda i: (
+				self.sp_rl2.blockSignals(True), self.sp_rl2.setValue(self.i2v_rl2(i)), self.sp_rl2.blockSignals(False),
+				setattr(self, "_pl_roll", self.i2v_rl2(i)), self._update_plane_from_ui()
 			))
 
 			self.btn_fit_plane.clicked.connect(self._fit_table_plane)
@@ -420,6 +585,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self.sp_roi_ymax.valueChanged.connect(lambda _: _sync_slider_from_spin())
 
 			right.addWidget(card_roi)
+			card_roi._content.setVisible(False)
 			right.addItem(QtWidgets.QSpacerItem(0, 0, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding))
 
 			self.roi_edges = gl.GLLinePlotItem(mode='lines', width=2.0)
@@ -463,17 +629,8 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		# ---------- BOTTOM BUTTONS ----------
 		if 1:
 			btn_row = QtWidgets.QHBoxLayout()
-			self.btn_reset   = QtWidgets.QPushButton("Reset View")
-			self.btn_view_u = QtWidgets.QPushButton("<-")
-			self.btn_view_v = QtWidgets.QPushButton("->")
 			self.btn_save    = QtWidgets.QPushButton("Save")
 			self.btn_cancel  = QtWidgets.QPushButton("Cancel")
-
-			btn_row.addWidget(self.btn_reset) 
-			btn_row.insertWidget(1, self.btn_view_u)
-			btn_row.insertWidget(2, QtWidgets.QLabel("Plane View"))
-			btn_row.insertWidget(3, self.btn_view_v)
-			btn_row.addStretch(1)
 			btn_row.addWidget(self.btn_cancel)
 			btn_row.addWidget(self.btn_save)
 			panel_layout.addLayout(btn_row)
@@ -482,9 +639,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			# Wire updates into draw path
 			for w in (self.cx,self.cy,self.cz,self.ex,self.ey,self.ez,self.yaw,self.pitch,self.roll):
 				w.valueChanged.connect(self._update_box)
-			self.btn_reset.clicked.connect(self._set_default_view) 
-			self.btn_view_u.clicked.connect(lambda: self._view_from_axis(1))
-			self.btn_view_v.clicked.connect(lambda: self._view_from_axis(-1))
 			self.btn_save.clicked.connect(self._save)
 			self.btn_cancel.clicked.connect(self.canceled.emit)
 
@@ -503,49 +657,225 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		self.timer.start(66)
 
 	def _tick(self):
-		# Update cloud
-		xyz = self.worker.get_point_cloud_snapshot()
-		if xyz is not None and xyz.shape[0] > 0:
+		idx = self.leftTabs.currentIndex()
 
-			# current box params
-			c = np.array([self.cx.value(), self.cy.value(), self.cz.value()], float)
-			e = np.array([self.ex.value(), self.ey.value(), self.ez.value()], float)
-			R = self._R_yxz(self.yaw.value(), self.pitch.value(), self.roll.value())
+		# Tab 0: 3D
+		if idx == 0:
+			xyz = self.worker.get_point_cloud_snapshot()
+			if xyz is not None and xyz.shape[0] > 0 and self.plane is not None:
+				m8 = self._mask_radius_from_plane_center(xyz, 5)
+				xyz_vis = xyz[m8]
+			else:
+				m8 = None
+				xyz_vis = None
 
-			Xloc = (xyz - c) @ R
-			inside = (np.abs(Xloc[:,0]) <= e[0]) & (np.abs(Xloc[:,1]) <= e[1]) & (np.abs(Xloc[:,2]) <= e[2])
+			if xyz_vis is not None and xyz_vis.shape[0] > 0:
+				c = np.array([self.cx.value(), self.cy.value(), self.cz.value()], float)
+				e = np.array([self.ex.value(), self.ey.value(), self.ez.value()], float)
+				R = self._R_yxz(self.yaw.value(), self.pitch.value(), self.roll.value())
 
-			colors = np.zeros((xyz.shape[0], 4), float)
-			colors[:] = (1,1,1, 0.60)
-			if self.pts_visible:
-				colors[inside] = (0.10, 1.00, 0.30, 0.95)
+				Xloc = (xyz_vis - c) @ R
+				inside = (np.abs(Xloc[:,0]) <= e[0]) & (np.abs(Xloc[:,1]) <= e[1]) & (np.abs(Xloc[:,2]) <= e[2])
 
-			self.cloud_item.setData(pos=xyz, color=colors)
+				# ROI (on full cloud so alpha can lift ROI even when far)
+				roi_full = self._roi_mask(xyz) if getattr(self, "roi_visible", True) else np.zeros(xyz.shape[0], bool)
+				roi_vis  = roi_full[m8]
+
+				# Base color/alpha
+				colors = np.zeros((xyz_vis.shape[0], 4), float)
+				colors[:] = (1, 1, 1, 0.60)
+
+				# Depth-to-camera colouring
+				if self.chkDepthColour.isChecked():
+					rgb = self._apply_jet_colour_by_cam_dist(xyz_vis)
+					colors[:, :3] = rgb
+
+				# Plane-center fade for alpha?
+				if self.chkPlaneFade.isChecked() and self.plane is not None:
+					a = self._alpha_by_plane_center(xyz_vis, roi_vis)
+					colors[:, 3] = a
+
+				# ROI highlight (ensure ROI points very visible)
+				colors[roi_vis, :3] = np.minimum(colors[roi_vis, :3] + 0.25, 1.0)
+				colors[roi_vis, 3]  = 1.0
+
+				if self.pts_visible:
+					colors[inside] = (1.0, 1.0, 1.0, 0.8)
+				self.cloud_item.setData(pos=xyz_vis, color=colors)
+
+		# Tab 1: Camera
+		elif idx == 1:
+			frm = getattr(self.worker, "get_rgb_frame", lambda: None)()
+			if frm is not None:
+				# assume BGR uint8
+				if len(frm.shape) == 3 and frm.shape[2] == 3:
+					rgb = cv2.cvtColor(frm, cv2.COLOR_BGR2RGB)
+					h, w, _ = rgb.shape
+					qimg = QtGui.QImage(rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
+					self.camLabel.setPixmap(QtGui.QPixmap.fromImage(qimg).scaled(
+						self.camLabel.width(), self.camLabel.height(),
+						QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+		
+		# Tab 2: Plane 2D
+		else:
+			xyz = self.worker.get_point_cloud_snapshot()
+			if xyz is None or xyz.shape[0] == 0 or self.plane is None:
+				# clear current view quickly
+				idx2 = self.plane2dTabs.currentIndex()
+				if idx2 == 0: self.sp_uv.setData([], [])
+				elif idx2 == 1: self.sp_un.setData([], [])
+				else: self.sp_vn.setData([], [])
+				return
+
+			m8 = self._mask_radius_from_plane_center(xyz, 2)
+			if not m8.any():
+				idx2 = self.plane2dTabs.currentIndex()
+				if idx2 == 0: self.sp_uv.setData([], [])
+				elif idx2 == 1: self.sp_un.setData([], [])
+				else: self.sp_vn.setData([], [])
+				return
+
+			down_sample = 4
+			xyz8 = xyz[m8][::down_sample]
+			roi8 = self._roi_mask(xyz)[m8][::down_sample]
+
+			# --- Project once ---
+			R = self._plane_R_from_base_and_loc()  # [u n v]
+			u, n, v = R[:,0], R[:,1], R[:,2]
+			p0 = self._plane_p0_from_base_and_loc()
+			d = xyz8 - p0[None, :]
+			u_coord = d @ u
+			n_coord = d @ n
+			v_coord = d @ v
+
+			# ---- Colour/alpha only if needed ----
+			want_depth = self.chkDepthColour.isChecked()
+			want_fade  = self.chkPlaneFade.isChecked()
+
+			if not want_depth and not want_fade:
+				# FAST PATH: one brush for all points, no per-spot objects
+				brush = pg.mkBrush(255, 255, 255, 230)
+				idx2 = self.plane2dTabs.currentIndex()
+				if idx2 == 0:
+					self.sp_uv.setData(u_coord, v_coord, brush=brush, pen=None, size=3)
+				elif idx2 == 1:
+					self.sp_un.setData(u_coord, n_coord, brush=brush, pen=None, size=3)
+				else:
+					self.sp_vn.setData(v_coord, n_coord, brush=brush, pen=None, size=3)
+				return
+
+			# SLOW PATH (still optimized): compute RGBA once, quantize, reuse brushes
+			# Base color
+			if want_depth:
+				rgb01 = self._apply_jet_colour_by_cam_dist(xyz8)
+			else:
+				rgb01 = np.ones((xyz8.shape[0], 3), dtype=float)
+
+			# Alpha
+			if want_fade:
+				a01 = self._alpha_by_plane_center(xyz8, roi8)
+			else:
+				a01 = np.ones(xyz8.shape[0], dtype=float)
+
+			# ROI lift (brighten & full alpha)
+			if roi8.any():
+				rgb01[roi8] = np.minimum(rgb01[roi8] + 0.25, 1.0)
+				a01[roi8]   = 1.0
+
+			# pack to uint8 once
+			rgba = np.empty((xyz8.shape[0], 4), dtype=np.uint8)
+			rgba[:,0:3] = np.clip((rgb01 * 255.0), 0, 255).astype(np.uint8)
+			rgba[:,3]   = np.clip((a01   * 255.0), 0, 255).astype(np.uint8)
+
+			uniq_rgba, inv = self._quantize_rgba(rgba, q=32)
+			pool = self._brush_pool_from_rgba(uniq_rgba)
+			brushes = [pool[i] for i in inv]
+
+			# Update ONLY the selected sub-tab
+			idx2 = self.plane2dTabs.currentIndex()
+			if idx2 == 0:
+				self.sp_uv.setData(u_coord, v_coord, brush=brushes, pen=None, size=3)
+			elif idx2 == 1:
+				self.sp_un.setData(u_coord, n_coord, brush=brushes, pen=None, size=3)
+			else:
+				self.sp_vn.setData(v_coord, n_coord, brush=brushes, pen=None, size=3)
+			
+			self._lock_viewbox(idx2)
+
+			# Build polylines for each projection (separate segments with NaN)
+			def segs(xs, ys):
+				X, Y = [], []
+				for a,b in edges:
+					X += [xs[a], xs[b], np.nan]
+					Y += [ys[a], ys[b], np.nan]
+				return np.array(X), np.array(Y)
+
+			edges = [(0,1),(2,3),(4,5),(6,7),
+					(0,2),(1,3),(4,6),(5,7), 
+					(0,4),(1,5),(2,6),(3,7)] 
+
+			# Overlays
+			# Box
+			if self.box_visible:
+				boxW = self._box_corners_world()
+				uvn  = self._project_uvn(boxW)  
+				U, N, V = uvn[:,0], uvn[:,1], uvn[:,2]
+				if idx2 == 0: x_uv, y_uv = segs(U, V); self.uv_box.setData(x_uv, y_uv)
+				if idx2 == 1: x_un, y_un = segs(U, N); self.un_box.setData(x_un, y_un)
+				if idx2 == 2: x_vn, y_vn = segs(V, N); self.vn_box.setData(x_vn, y_vn)
+			else:
+				self.uv_box.setData([],[]); self.un_box.setData([],[]); self.vn_box.setData([],[])
+
+			# ROI
+			if self.roi_visible:
+				p0 = np.asarray(self.plane.p0, float)
+				u  = np.asarray(self.plane.u,  float)
+				v  = np.asarray(self.plane.v,  float)
+				n  = np.asarray(self.plane.n,  float)
+				w  = float(self.pl_size_x)
+				l  = float(self.pl_size_z)
+				y0 = float(getattr(self, "roi_y_min", 0.0))
+				y1 = float(getattr(self, "roi_y_max", 0.2))
+
+				roiW = self._roi_corners_ext(p0, u, v, n, w, l, y0, y1)   # (8,3) world
+				uvn  = self._project_uvn(roiW)                            # (8,3) projected (with flips)
+
+				# --- UV uses the rectangle polygon derived from min/max ---
+				if idx2 == 0:
+					UVx, UVy = self._roi_square_uv_poly(uvn)
+					self.uv_roi.setData(UVx, UVy)   # closed loop
+
+				# --- UN / VN keep the 12-edge wireframe (your existing code) ---
+				else:
+					U, N, V = uvn[:,0], uvn[:,1], uvn[:,2]
+					if idx2 == 1:
+						x_un, y_un = segs(U, N); self.un_roi.setData(x_un, y_un)
+					else:
+						x_vn, y_vn = segs(V, N); self.vn_roi.setData(x_vn, y_vn)
+			else:
+				self.uv_roi.setData([], []); self.un_roi.setData([], []); self.vn_roi.setData([], [])
+
+			if self.pl_visible:
+				pc = self._plane_corners_world()
+				if pc is not None:
+					uvn_plane = self._project_uvn(pc)  
+					Uc, Nc, Vc = uvn_plane[:,0], uvn_plane[:,1], uvn_plane[:,2]
+
+					UVx = np.r_[Uc, Uc[:1]]; UVy = np.r_[Vc, Vc[:1]]
+					UNx = np.r_[Uc, Uc[:1]]; UNy = np.r_[Nc, Nc[:1]]
+					VNx = np.r_[Vc, Vc[:1]]; VNy = np.r_[Nc, Nc[:1]]
+
+					if idx2 == 0: self.uv_plane_poly.setData(UVx, UVy)
+					if idx2 == 1: self.un_plane_poly.setData(UNx, UNy)
+					if idx2 == 2: self.vn_plane_poly.setData(VNx, VNy)
+			else:
+				self.uv_plane_poly.setData([], []); self.un_plane_poly.setData([], []); self.vn_plane_poly.setData([], [])
 
 		self._update_box()
 		if self.plane is not None:
 			self._update_plane_draw()
 			self._update_global_axes()
-		
-		# --- update axis HUDs ---
-		try:
-			VM = np.array(self.gl.viewMatrix().data()).reshape(4,4).T
-			Rw = VM[:3,:3]  # world -> camera
-		except Exception:
-			Rw = np.eye(3)
-
-		# Camera glyph: identity in camera space
-		R_cam_world = Rw.T
-		self.glyph_cam.setRotationCam(R_cam_world)
-
-		# Box glyph: local axes in world -> camera
-		R_box_world = self._R_yxz(self.yaw.value(), self.pitch.value(), self.roll.value())
-		self.glyph_box.setRotationCam(Rw @ R_box_world)
-
-		# Plane glyph: [u n v] in world -> camera
-		if self.plane is not None:
-			R_plane_world = np.column_stack([self.plane.u, self.plane.n, self.plane.v])
-			self.glyph_plane.setRotationCam(Rw @ R_plane_world)
+		self._update_axis_huds()
 
 	def _load_defaults(self):
 		#Read JSON state (if exists) and apply as current defaults
@@ -614,12 +944,21 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self.pl_size_x = float(pl.get("width_m", 0.70))
 			self.pl_size_z = float(pl.get("length_m", 0.70))
 			
-			self.sp_lx.setValue(self._pl_off_local[0])
-			self.sp_ly.setValue(self._pl_off_local[1])
-			self.sp_lz.setValue(self._pl_off_local[2])
-			self.sp_yw2.setValue(self._pl_yaw)
-			self.sp_pt2.setValue(self._pl_pitch)
-			self.sp_rl2.setValue(self._pl_roll)
+			# ----- reflect local offsets into spin + slider -----
+			self.sp_lx.blockSignals(True); self.sp_lx.setValue(self._pl_off_local[0]); self.sp_lx.blockSignals(False)
+			self.sp_ly.blockSignals(True); self.sp_ly.setValue(self._pl_off_local[1]); self.sp_ly.blockSignals(False)
+			self.sp_lz.blockSignals(True); self.sp_lz.setValue(self._pl_off_local[2]); self.sp_lz.blockSignals(False)
+			self.s_lx.blockSignals(True); self.s_lx.setValue(self.v2i_lx(self._pl_off_local[0])); self.s_lx.blockSignals(False)
+			self.s_ly.blockSignals(True); self.s_ly.setValue(self.v2i_ly(self._pl_off_local[1])); self.s_ly.blockSignals(False)
+			self.s_lz.blockSignals(True); self.s_lz.setValue(self.v2i_lz(self._pl_off_local[2])); self.s_lz.blockSignals(False)
+
+			# ----- reflect local rotations into spin + slider -----
+			self.sp_yw2.blockSignals(True); self.sp_yw2.setValue(self._pl_yaw);   self.sp_yw2.blockSignals(False)
+			self.sp_pt2.blockSignals(True); self.sp_pt2.setValue(self._pl_pitch); self.sp_pt2.blockSignals(False)
+			self.sp_rl2.blockSignals(True); self.sp_rl2.setValue(self._pl_roll);  self.sp_rl2.blockSignals(False)
+			self.s_yw2.blockSignals(True); self.s_yw2.setValue(self.v2i_yw2(self._pl_yaw));   self.s_yw2.blockSignals(False)
+			self.s_pt2.blockSignals(True); self.s_pt2.setValue(self.v2i_pt2(self._pl_pitch)); self.s_pt2.blockSignals(False)
+			self.s_rl2.blockSignals(True); self.s_rl2.setValue(self.v2i_rl2(self._pl_roll));  self.s_rl2.blockSignals(False)
 
 			# Populate UI controls to reflect size/visibility/local edits
 			self.sp_plane_w.blockSignals(True); self.sp_plane_w.setValue(self.pl_size_x); self.sp_plane_w.blockSignals(False)
@@ -707,9 +1046,10 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 
 	def _save(self):
 		
-		self.saved.emit(None)
+		self.saved.emit({})
 
 		# Write the full state to JSON
+		self._canonicalize_base_from_current()
 		state = self._state_to_dict()
 		try:
 			with open(self.config_path, "w", encoding="utf-8") as f:
@@ -718,6 +1058,28 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 										f"Saved config → {os.path.basename(self.config_path)}")
 		except Exception as e:
 			QtWidgets.QMessageBox.warning(self, "Save error", f"Could not write config:\n{e}")
+
+	def _canonicalize_base_from_current(self):
+		if self.plane is None:
+			return
+
+		# Current displayed plane pose (already includes flip_n & locals)
+		R_cur = np.column_stack([np.asarray(self.plane.u), 
+								np.asarray(self.plane.n),
+								np.asarray(self.plane.v)])
+		# R_cur = self._orthonormalize(R_cur)
+		p0_cur = np.asarray(self.plane.p0, float)
+
+		# Local transforms currently in the UI
+		R_loc = self._R_yxz(self._pl_yaw, self._pl_pitch, self._pl_roll)  
+		off_loc = np.asarray(self._pl_off_local, float)
+		R_base = R_cur @ R_loc.T
+
+		# R_base = self._orthonormalize(R_base)
+		p0_base = p0_cur - R_base @ off_loc
+
+		self._pl_R_base = R_base
+		self._pl_p0_base = p0_base
 
 	def eventFilter(self, obj, ev):
 		if obj is self.gl and ev.type() == QtCore.QEvent.MouseButtonDblClick:
@@ -728,34 +1090,128 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 
 	def _set_worker(self, worker):
 		self.worker = worker
+		if hasattr(worker, "rgb_for_wizard"):
+			worker.rgb_for_wizard.connect(self._on_rgb_for_wizard)
+
+	def _on_left_tab_changed(self, idx:int):
+		# 0: 3D, 1: Camera, 2: Plane 2D
+		self.contextStack.setCurrentIndex(idx)
+
+	def _snapshot_camera_frame(self):
+		frm = getattr(self.worker, "get_rgb_frame", lambda: None)()
+		if frm is None:
+			return
+		ts = time.strftime("%Y%m%d_%H%M%S")
+		path = os.path.join(os.path.expanduser("~"), f"camera_{ts}.png")
+		try:
+			cv2.imwrite(path, frm)
+			QtWidgets.QToolTip.showText(self.mapToGlobal(QtCore.QPoint(0,0)), f"Saved {os.path.basename(path)}")
+		except Exception as e:
+			QtWidgets.QMessageBox.warning(self, "Snapshot", f"Could not save:\n{e}")
+
+#============== Projection Funcs ========================
+	def _plane_corners_world(self):
+		"""Return (4,3) world coords of plane rectangle corners using current size/pose."""
+		if self.plane is None:
+			return None
+		w = float(self.pl_size_x); l = float(self.pl_size_z)
+		hx, hz = 0.5*w, 0.5*l
+		u, n, v = self.plane.u, self.plane.n, self.plane.v
+		p0 = self.plane.p0
+		corners = np.vstack([
+			p0 + (-hx)*u + (-hz)*v,
+			p0 + ( +hx)*u + (-hz)*v,
+			p0 + ( +hx)*u + ( +hz)*v,
+			p0 + (-hx)*u + ( +hz)*v,
+		])
+		return corners
+
+	def _box_corners_world(self):
+		# box center/extends/rotation from your existing controls
+		c = np.array([self.cx.value(), self.cy.value(), self.cz.value()], float)
+		e = np.array([self.ex.value(), self.ey.value(), self.ez.value()], float)
+		Rloc = self._R_yxz(self.yaw.value(), self.pitch.value(), self.roll.value())
+		# 8 corners in local coords
+		s = np.array([[-1,-1,-1],[+1,-1,-1],[-1,+1,-1],[+1,+1,-1],
+					[-1,-1,+1],[+1,-1,+1],[-1,+1,+1],[+1,+1,+1]], float) * e
+		return c[None,:] + s @ Rloc.T  # (8,3) world
+	
+	def _roi_corners_world(self):
+		# ROI center/extends/rotation from your existing controls
+		c = np.array([self.cx.value(), self.cy.value(), self.cz.value()], float)
+		e = np.array([self.ex.value(), self.ey.value(), self.ez.value()], float)
+		Rloc = self._R_yxz(self.yaw.value(), self.pitch.value(), self.roll.value())
+		# 8 corners in local coords
+		s = np.array([[-1,-1,-1],[+1,-1,-1],[-1,+1,-1],[+1,+1,-1],
+					[-1,-1,+1],[+1,-1,+1],[-1,+1,+1],[+1,+1,+1]], float) * e
+		return c[None,:] + s @ Rloc.T  # (8,3) world
+
+	def _project_uvn(self, P):
+		"""Project Nx3 world points into (u,n,v)."""
+		R = self._plane_R_from_base_and_loc()  # [u n v]
+		p0 = self._plane_p0_from_base_and_loc()
+		D = P - p0[None,:]
+		uvn = D @ R  # columns are [u, n, v]
+		return uvn  # (N,3)
+
+	def _quantize_rgba(self, rgba_u8: np.ndarray, q: int = 16):
+		if rgba_u8.dtype != np.uint8:
+			rgba_u8 = rgba_u8.astype(np.uint8, copy=False)
+		rgba_u8 = np.ascontiguousarray(rgba_u8)
+
+		# snap channels to {0, step, 2*step, ..., 255}
+		qstep = max(1, 255 // q)
+		q_rgba = (rgba_u8 // qstep) * qstep  # uint8
+
+		# pack to 32-bit for fast unique
+		packed = (q_rgba[:, 0].astype(np.uint32) << 24) | \
+				(q_rgba[:, 1].astype(np.uint32) << 16) | \
+				(q_rgba[:, 2].astype(np.uint32) << 8)  | \
+				(q_rgba[:, 3].astype(np.uint32))
+
+		uniq, inv = np.unique(packed, return_inverse=True)  # <-- fixed name
+
+		uniq_rgba = np.column_stack([
+			(uniq >> 24) & 0xFF,
+			(uniq >> 16) & 0xFF,
+			(uniq >> 8)  & 0xFF,
+			(uniq)       & 0xFF
+		]).astype(np.uint8)
+
+		return uniq_rgba, inv
+
+	def _brush_pool_from_rgba(self, uniq_rgba_u8: np.ndarray):
+		if not hasattr(self, "_brush_cache"):
+			self._brush_cache = {}  # key: (r,g,b,a) -> QBrush
+		pool = []
+		for r, g, b, a in uniq_rgba_u8:
+			key = (int(r), int(g), int(b), int(a))
+			br = self._brush_cache.get(key)
+			if br is None:
+				br = pg.mkBrush(key[0], key[1], key[2], key[3])
+				self._brush_cache[key] = br
+			pool.append(br)
+		return pool
+#========================================================
 
 #============== Plane Functions =========================	
 	def _plane_R_from_base_and_loc(self):
-		"""Compute [u n v] from base pose + local yaw/pitch/roll, no self.plane dependency."""
+		# if self.plane is None:
+		# 	return None
 		y, p, r = np.deg2rad([self._pl_yaw, self._pl_pitch, self._pl_roll])
 		Rloc = _Ry(y) @ _Rx(p) @ _Rz(r)
-		return self._pl_R_base @ Rloc
+		R0 = self._pl_R_base @ Rloc         
+		u = R0[:, 0]
+		n = R0[:, 1]
+		v = R0[:, 2]
+		if getattr(self, "flip_n", False):
+			n = -n
+		return np.column_stack([u, n, v])
 
 	def _plane_p0_from_base_and_loc(self):
-		"""Compute current plane center from base + local offsets along (u,n,v), no self.plane dependency."""
+		# if self.plane is None:
+		# 	return None		
 		R = self._plane_R_from_base_and_loc()
-		u, n, v = R[:,0], R[:,1], R[:,2]
-		off = self._pl_off_local
-		return self._pl_p0_base + off[0]*u + off[1]*n + off[2]*v
-
-	def _plane_current_R(self):
-		"""R columns are [u, n, v] after applying local rotations (Y,X,Z in that local order)."""
-		if self.plane is None:
-			return None
-		y, p, r = np.deg2rad([self._pl_yaw, self._pl_pitch, self._pl_roll])
-		Rloc = _Ry(y) @ _Rx(p) @ _Rz(r)        # about [Y=normal, X=u, Z=v] in local
-		return self._pl_R_base @ Rloc
-
-	def _plane_current_p0(self):
-		"""Current plane center from base + local offsets along [u, n, v]."""
-		if self.plane is None:
-			return None
-		R = self._plane_current_R()
 		u, n, v = R[:,0], R[:,1], R[:,2]
 		off = self._pl_off_local
 		return self._pl_p0_base + off[0]*u + off[1]*n + off[2]*v
@@ -765,8 +1221,8 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		if self.plane is None:
 			self._update_plane_draw()
 			return
-		R = self._plane_current_R()
-		p0 = self._plane_current_p0()
+		R = self._plane_R_from_base_and_loc()
+		p0 = self._plane_p0_from_base_and_loc()
 		u, n, v = R[:,0], R[:,1], R[:,2]
 		self.plane = TablePlane(n=n, d=-(n @ p0), p0=p0, u=u, v=v)
 		self._update_plane_draw()
@@ -1085,9 +1541,113 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		for i,j in E:
 			lines.append(V[i]); lines.append(V[j])
 		self.roi_edges.setData(pos=np.asarray(lines, float), color=(0.85,0.85,0.85,0.9))
+
+	def _order_roi8_uvn(self, uvn):
+		assert uvn.shape == (8, 3)
+		U, N, V = uvn[:, 0], uvn[:, 1], uvn[:, 2]
+
+		# Split into two faces by N (plane-normal axis in projection)
+		# Use a numeric split to avoid sign/center assumptions.
+		orderN = np.argsort(N)
+		lower_idxs = orderN[:4]   # 4 smallest N
+		upper_idxs = orderN[4:]   # 4 largest  N
+
+		def _ccw_on_face(idxs):
+			pts = uvn[idxs][:, [0, 2]]          # (U, V) plane
+			c = pts.mean(axis=0)
+			ang = np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0])
+			return idxs[np.argsort(ang)]        # CCW
+
+		lower_ccw = _ccw_on_face(lower_idxs)
+		upper_ccw = _ccw_on_face(upper_idxs)
+
+		return np.concatenate([lower_ccw, upper_ccw])
+
+	def _roi_square_uv_poly(self, uvn: np.ndarray):
+
+		assert uvn.shape == (8, 3)
+		U = uvn[:, 0]
+		V = uvn[:, 2]
+
+		# The ROI in u–v is axis-aligned ⇒ corners are at (min/max U) × (min/max V)
+		umin, umax = float(U.min()), float(U.max())
+		vmin, vmax = float(V.min()), float(V.max())
+
+		# Order consistently (CCW): (umin,vmin) → (umax,vmin) → (umax,vmax) → (umin,vmax) → back to start
+		UVx = np.array([umin, umax, umax, umin, umin], dtype=float)
+		UVy = np.array([vmin, vmin, vmax, vmax, vmin], dtype=float)
+		return UVx, UVy
 #=========================================================
 
 #================ Graphics ===============================
+	def _plane_center_world(self):
+		# plane origin at base + local offset
+		return self._plane_p0_from_base_and_loc() if self.plane is not None else np.zeros(3)
+
+	def _camera_origin_world(self):
+		# Try worker first, else fall back to (0,0,0)
+		p = getattr(self.worker, "get_camera_origin_world", lambda: None)()
+		return p if p is not None else np.zeros(3)
+
+	def _mask_radius_from_plane_center(self, xyz, rad):
+		p0 = self._plane_center_world()
+		return np.linalg.norm(xyz - p0[None, :], axis=1) <= rad
+
+	def _roi_mask(self, xyz):
+		# Same ROI logic you already use in 3D (box in local coords)
+		c = np.array([self.cx.value(), self.cy.value(), self.cz.value()], float)
+		e = np.array([self.ex.value(), self.ey.value(), self.ez.value()], float)
+		R = self._R_yxz(self.yaw.value(), self.pitch.value(), self.roll.value())
+		Xloc = (xyz - c) @ R
+		return (np.abs(Xloc[:,0]) <= e[0]) & (np.abs(Xloc[:,1]) <= e[1]) & (np.abs(Xloc[:,2]) <= e[2])
+
+	def _apply_jet_colour_by_cam_dist(self, xyz):
+		"""Return RGB in [0,1] using JET mapping of distance to camera (auto range)."""
+		d = np.linalg.norm(xyz, axis=1)
+		if d.size == 0:
+			return np.zeros((0,3))
+		# Robust min/max to avoid flicker; tweak as needed
+		d0, d1 = np.percentile(d, 1), np.percentile(d, 95)
+		if d1 <= d0: d1 = d0 + 1e-6
+		t = np.clip((d - d0) / (d1 - d0), 0.0, 1.0)
+		return self._jet_rgb01(t)
+	
+	def _lock_viewbox(self, idx2):
+		vb = (self.plot_uv if idx2==0 else self.plot_un if idx2==1 else self.plot_vn).getViewBox()
+		vb.disableAutoRange(pg.ViewBox.XYAxes)
+
+	def _alpha_by_plane_center(self, xyz, roi_mask):
+		"""Alpha fades with radius from plane center; ROI points stay opaque."""
+		p0 = self._plane_center_world()
+		r = np.linalg.norm(xyz - p0[None, :], axis=1)
+		# 0m→1.0, 8m→~0.1 (tweak floor if you want)
+		a = 1.0 - (r / 3.0)
+		a = np.clip(a, 0.1, 0.6)
+		a[roi_mask] = 1.0
+		return a
+
+	def _jet_rgb01(self, t):
+		"""t in [0,1] → approximate JET RGB in [0,1]."""
+		# piecewise JET (blue→cyan→yellow→red)
+		r = np.clip(1.5 - np.abs(4.0*(t - 0.75)), 0, 1)
+		g = np.clip(1.5 - np.abs(4.0*(t - 0.50)), 0, 1)
+		b = np.clip(1.5 - np.abs(4.0*(t - 0.25)), 0, 1)
+		return np.stack([r, g, b], axis=1)
+
+	def _update_axis_huds(self):
+		try:
+			VM = np.array(self.gl.viewMatrix().data()).reshape(4,4).T
+			Rw = VM[:3,:3]
+		except Exception:
+			Rw = np.eye(3)
+		R_cam_world = Rw.T
+		self.glyph_cam.setRotationCam(R_cam_world)
+		R_box_world = self._R_yxz(self.yaw.value(), self.pitch.value(), self.roll.value())
+		self.glyph_box.setRotationCam(Rw @ R_box_world)
+		if self.plane is not None:
+			R_plane_world = np.column_stack([self.plane.u, self.plane.n, self.plane.v])
+			self.glyph_plane.setRotationCam(Rw @ R_plane_world)
+
 	def _view_from_axis(self, dir):
 	
 		if self.plane is None:
@@ -1164,7 +1724,116 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		item = gl.GLLinePlotItem(pos=p, color=color, width=width, mode='lines')
 		self.gl.addItem(item)
 		return item
+	
+	def _build_bot_controls_row(self):
+		row = QtWidgets.QWidget()
+		h = QtWidgets.QHBoxLayout(row); h.setContentsMargins(0,0,0,0); h.setSpacing(6)
+
+		btnToggleBox   = QtWidgets.QPushButton("Box")
+		btnTogglePlane = QtWidgets.QPushButton("Plane")
+		btnToggleRoi   = QtWidgets.QPushButton("ROI")
+		chkDepth       = QtWidgets.QCheckBox("Depth")
+		chkFade        = QtWidgets.QCheckBox("Fade")
+
+		h.addWidget(btnToggleBox)
+		h.addWidget(btnTogglePlane)
+		h.addWidget(btnToggleRoi)
+		h.addStretch(1)
+		h.addWidget(chkDepth)
+		h.addWidget(chkFade)
+
+		# wire buttons to the same state you already use
+		btnToggleBox.clicked.connect(lambda: (setattr(self, "box_visible", not getattr(self, "box_visible", True)),
+											self.chk_box_visible.setChecked(self.box_visible),
+											self._update_box()))
+		btnTogglePlane.clicked.connect(lambda: (setattr(self, "pl_visible", not getattr(self, "pl_visible", True)),
+												self.chk_plane_visible.setChecked(self.pl_visible),
+												self._update_plane_draw()))
+		btnToggleRoi.clicked.connect(lambda: (setattr(self, "roi_visible", not getattr(self, "roi_visible", True)),
+											self.chk_roi_visible.setChecked(self.roi_visible),
+											self._update_roi_preview()))
+		return row, chkDepth, chkFade
+
+	def resizeEvent(self, ev: QtGui.QResizeEvent):
+		super().resizeEvent(ev)
+		# Recompute once per resize
+		if hasattr(self, "camLabel"):
+			# Cache the *content* size available to the label (layout margins already handled by layouts)
+			self._cam_target_size = self.camLabel.size()
+
+	@QtCore.pyqtSlot(QtGui.QImage)
+	def _on_rgb_for_wizard(self, qimg: QtGui.QImage):
+		self.camLabel.setImage(qimg)
+
 #=================================================================
+
+def _plane_R_from_base_and_loc(_pl_R_base, _pl_yaw, _pl_pitch, _pl_roll, flip_n=False):
+	y, p, r = np.deg2rad([_pl_yaw, _pl_pitch, _pl_roll])
+	Rloc = _Ry(y) @ _Rx(p) @ _Rz(r)
+	R0 = _pl_R_base @ Rloc         
+	u = R0[:, 0]
+	n = R0[:, 1]
+	v = R0[:, 2]
+	if flip_n:
+		n = -n
+	return np.column_stack([u, n, v])
+
+def _plane_corners_world(plane, pl_size_x, pl_size_z):
+	"""Return (4,3) world coords of plane rectangle corners using current size/pose."""
+	if plane is None:
+		return None
+	w = float(pl_size_x); l = float(pl_size_z)
+	hx, hz = 0.5*w, 0.5*l
+	u, n, v = plane.u, plane.n, plane.v
+	p0 = plane.p0
+	corners = np.vstack([
+		p0 + (-hx)*u + (-hz)*v,
+		p0 + ( +hx)*u + (-hz)*v,
+		p0 + ( +hx)*u + ( +hz)*v,
+		p0 + (-hx)*u + ( +hz)*v,
+	])
+	return corners
+
+def _box_mask(xyz, cx, cy, cz, ex, ey, ez, yaw, pitch, roll):
+	c = np.array([cx, cy, cz], float)
+	e = np.array([ex, ey, ez], float)
+	R = _R_yxz(yaw, pitch, roll)
+	Xloc = (xyz - c) @ R
+	return (np.abs(Xloc[:,0]) <= e[0]) & (np.abs(Xloc[:,1]) <= e[1]) & (np.abs(Xloc[:,2]) <= e[2])
+
+def corners_world(cx, cy, cz, ex, ey, ez, yaw, pitch, roll):
+	# ROI center/extends/rotation from your existing controls
+	c = np.array([cx, cy, cz], float)
+	e = np.array([ex, ey, ez], float)
+	Rloc = _R_yxz(yaw, pitch, roll)
+	# 8 corners in local coords
+	s = np.array([[-1,-1,-1],[+1,-1,-1],[-1,+1,-1],[+1,+1,-1],
+				[-1,-1,+1],[+1,-1,+1],[-1,+1,+1],[+1,+1,+1]], float) * e
+	return c[None,:] + s @ Rloc.T  # (8,3) world
+
+def _project_uvn(P):
+	"""Project Nx3 world points into (u,n,v)."""
+	R = _plane_R_from_base_and_loc()  # [u n v]
+	p0 = _plane_p0_from_base_and_loc()
+	D = P - p0[None,:]
+	uvn = D @ R  # columns are [u, n, v]
+	return uvn  # (N,3)
+
+def _plane_p0_from_base_and_loc(_pl_off_local, _pl_p0_base):
+	R = _plane_R_from_base_and_loc()
+	u, n, v = R[:,0], R[:,1], R[:,2]
+	off = _pl_off_local
+	return _pl_p0_base + off[0]*u + off[1]*n + off[2]*v
+
+def _R_yxz(yaw_deg, pitch_deg, roll_deg):
+	y, p, r = np.deg2rad([yaw_deg, pitch_deg, roll_deg])
+	return _Ry(y) @ _Rx(p) @ _Rz(r)
+
+def _euler_from_R_yxz(R):
+	pitch = -np.degrees(np.arcsin(R[1,2]))
+	yaw   =  np.degrees(np.arctan2(R[0,2], R[2,2]))
+	roll  =  np.degrees(np.arctan2(R[1,0], R[1,1]))
+	return _wrap_deg(yaw), _wrap_deg(pitch), _wrap_deg(roll)
 
 
 def _fit_plane_svd(pts: np.ndarray):

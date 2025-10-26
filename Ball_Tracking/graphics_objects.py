@@ -31,7 +31,7 @@ class CollapsibleCard(QtWidgets.QWidget):
 		self._button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
 		self._button.setArrowType(QtCore.Qt.DownArrow)
 		self._button.setCheckable(True)
-		self._button.setChecked(True)
+		self._button.setChecked(False)
 		self._button.clicked.connect(self._toggle)
 
 		frame = QtWidgets.QFrame(self)
@@ -180,6 +180,72 @@ class AxisGlyph(QtWidgets.QFrame):
 			p.setBrush(color)
 			p.drawPolygon(QtGui.QPolygonF([tip, left, right]))
 		p.end()
+
+
+# --- AspectImageView.py (or at the top of DEADSHOT.py and plane_wizard.py) ---
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+class AspectImageView(QtWidgets.QWidget):
+    """
+    A view that draws a QImage/QPixmap scaled to the widget's rect
+    with KeepAspectRatio. It does NOT let the image dictate window size.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pm = None
+        # Important: don't let the pixmap's natural size affect the layout
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.setMinimumSize(1, 1)
+        self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, False)  # keep background via style
+        self.setAutoFillBackground(True)
+
+    def sizeHint(self):
+        # Modest default hint; won't bloat layout
+        return QtCore.QSize(320, 240)
+
+    def minimumSizeHint(self):
+        return QtCore.QSize(1, 1)
+
+    @QtCore.pyqtSlot(QtGui.QImage)
+    def setImage(self, img: QtGui.QImage):
+        # Store as QPixmap once; paintEvent handles scaling
+        if img is None or img.isNull():
+            self._pm = None
+        else:
+            self._pm = QtGui.QPixmap.fromImage(img)
+        self.update()
+
+    @QtCore.pyqtSlot(QtGui.QPixmap)
+    def setPixmap(self, pm: QtGui.QPixmap):
+        self._pm = pm
+        self.update()
+
+    def clear(self):
+        self._pm = None
+        self.update()
+
+    def paintEvent(self, ev: QtGui.QPaintEvent):
+        p = QtGui.QPainter(self)
+        try:
+            # Fill background using style (so you don't see “creep” artifacts)
+            opt = QtWidgets.QStyleOption()
+            opt.initFrom(self)
+            self.style().drawPrimitive(QtWidgets.QStyle.PE_Widget, opt, p, self)
+
+            if not self._pm or self._pm.isNull():
+                return
+
+            # Compute target rect with aspect ratio preserved
+            wnd = self.rect()
+            pm_size = self._pm.size()
+            target = pm_size.scaled(wnd.size(), QtCore.Qt.KeepAspectRatio)
+            x = wnd.x() + (wnd.width()  - target.width())  // 2
+            y = wnd.y() + (wnd.height() - target.height()) // 2
+            p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+            p.drawPixmap(QtCore.QRect(x, y, target.width(), target.height()), self._pm)
+        finally:
+            p.end()
+
 
 def slider_style_for(color: QtGui.QColor) -> str:
 	c = color.name()
