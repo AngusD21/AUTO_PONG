@@ -268,3 +268,113 @@ class EKF3DDrag:
             p_prev, phi_prev = p_next, phi_next
 
         return None, None
+    
+
+# ======================= EKF (with drag) ======================
+# _EPS = 1e-9
+
+# def _accel_with_drag(v: np.ndarray, g: np.ndarray, beta: float) -> np.ndarray:
+# 	s = np.linalg.norm(v)
+# 	return g - beta * s * v if s > _EPS else g.copy()
+
+# def _jacobian_dvdt_dv(v: np.ndarray, beta: float) -> np.ndarray:
+# 	s = np.linalg.norm(v)
+# 	if s < _EPS:
+# 		return np.zeros((3,3))
+# 	I = np.eye(3)
+# 	return -beta * (s * I + np.outer(v, v) / s)
+
+# def _f(x: np.ndarray, g: np.ndarray, beta: float) -> np.ndarray:
+# 	v = x[3:]
+# 	a = _accel_with_drag(v, g, beta)
+# 	return np.hstack((v, a))
+
+# def _rk4_step(x: np.ndarray, dt: float, g: np.ndarray, beta: float) -> np.ndarray:
+# 	k1 = _f(x, g, beta)
+# 	k2 = _f(x + 0.5*dt*k1, g, beta)
+# 	k3 = _f(x + 0.5*dt*k2, g, beta)
+# 	k4 = _f(x + dt*k3, g, beta)
+# 	return x + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+
+# class EKF3DDrag:
+# 	"""x=[px,py,pz,vx,vy,vz]. Process: ṗ=v, v̇=g-β||v||v. Measurement: position (m)."""
+# 	def __init__(self, dt=EKF_DT, g=G_VECTOR, beta_drag=BETA_DRAG, Q_pos=Q_POS, Q_vel=Q_VEL, R_xyz=R_XYZ):
+# 		self.n = 6
+# 		self.dt = float(dt)
+# 		self.g = np.asarray(g, float).reshape(3)
+# 		self.beta_drag = float(beta_drag)
+# 		self.x = np.zeros(self.n, float)
+# 		self.P = np.diag([1e-2]*3 + [1e-1]*3).astype(float)
+# 		self.Q = np.diag([Q_pos]*3 + [Q_vel]*3).astype(float)
+# 		self.R = np.diag(R_xyz).astype(float)
+# 		self.H = np.zeros((3, self.n), float); self.H[0,0]=self.H[1,1]=self.H[2,2]=1.0
+# 		self.I = np.eye(self.n).astype(float)
+
+# 	def initialize(self, p_xyz, v_xyz=None):
+# 		p = np.asarray(p_xyz, float).reshape(3)
+# 		v = np.zeros(3, float) if v_xyz is None else np.asarray(v_xyz, float).reshape(3)
+# 		self.x[:3], self.x[3:] = p, v
+
+# 	def predict(self):
+# 		dt = self.dt
+# 		x_prev = self.x.copy()
+# 		self.x = _rk4_step(self.x, dt, self.g, self.beta_drag)
+# 		F = np.eye(self.n)
+# 		F[0:3,3:6] = dt*np.eye(3)
+# 		J = _jacobian_dvdt_dv(x_prev[3:], self.beta_drag)
+# 		F[3:6,3:6] += dt*J
+# 		self.P = F @ self.P @ F.T + self.Q
+# 		return self.x.copy(), self.P.copy()
+
+# 	def update_xyz(self, z_xyz, gate_alpha=GATE_ALPHA):
+# 		z = np.asarray(z_xyz, float).reshape(3)
+# 		H, R = self.H, self.R
+# 		y = z - (H @ self.x)
+# 		S = H @ self.P @ H.T + R
+# 		if gate_alpha is not None:
+# 			try:
+# 				S_inv_y = np.linalg.solve(S, y.reshape(3,1))
+# 				d2 = (y.reshape(1,3) @ S_inv_y).item()
+# 			except np.linalg.LinAlgError:
+# 				d2 = float("inf")
+# 			# rough chisq thresholds for 3 dof
+# 			thresh = 11.345 if gate_alpha >= 0.99 else 7.815
+# 			if gate_alpha >= 0.997: thresh = 14.160
+# 			if d2 > thresh:
+# 				return self.x.copy(), self.P.copy(), d2, thresh
+# 		try:
+# 			K = self.P @ H.T @ np.linalg.inv(S)
+# 		except np.linalg.LinAlgError:
+# 			K = self.P @ H.T @ np.linalg.inv(S + 1e-9*np.eye(3))
+# 		self.x = self.x + K @ y
+# 		self.P = (self.I - K @ H) @ self.P
+# 		return self.x.copy(), self.P.copy(), None, None
+
+# 	def predict_intercept_with_plane(self, n, d, t_max=2.0, step=None):
+# 		if step is None: step = self.dt
+# 		n = np.asarray(n, float).reshape(3)
+# 		def phi(p): return float(n @ p + d)
+# 		t = 0.0; xi = self.x.copy()
+# 		p_prev = xi[:3].copy(); phi_prev = phi(p_prev)
+# 		while t < t_max:
+# 			x_next = _rk4_step(xi, step, self.g, self.beta_drag)
+# 			t_next = t + step
+# 			p_next = x_next[:3]; phi_next = phi(p_next)
+# 			if abs(phi_prev) < _EPS: return t, p_prev
+# 			if phi_prev * phi_next < 0.0:
+# 				a_t, a_x = t, xi.copy()
+# 				b_t, b_x = t_next, x_next.copy()
+# 				for _ in range(24):
+# 					m_t = 0.5*(a_t+b_t)
+# 					m_x = _rk4_step(a_x, (m_t-a_t), self.g, self.beta_drag)
+# 					if phi_prev * phi(m_x[:3]) <= 0.0:
+# 						b_t, b_x = m_t, m_x
+# 					else:
+# 						a_t, a_x = m_t, m_x
+# 				t_hit = 0.5*(a_t+b_t)
+# 				p_hit = _rk4_step(self.x.copy(), t_hit, self.g, self.beta_drag)[:3]
+# 				return t_hit, p_hit
+# 			t, xi = t_next, x_next
+# 			p_prev, phi_prev = p_next, phi_next
+# 		return None, None
+# ===============================================================

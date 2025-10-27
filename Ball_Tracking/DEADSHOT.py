@@ -8,57 +8,25 @@ from dataclasses import dataclass
 from collections import deque
 import numpy as np
 import cv2
-import serial
-
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyrealsense2 as rs
 
-from Ball_Tracking.review_wizard import ReviewPage, VideoLabel, qimage_from_bgr
+from Ball_Tracking.review_wizard import ReviewCapture, ReviewPage, qimage_from_bgr, SEARCH_RADIUS_PX
 from Ball_Tracking.plane_wizard import PlaneSetupWizard, TablePlane
-from Ball_Tracking.graphics_objects import AspectImageView
-from Ball_Tracking.plane_math import (
-	overlay_plane_and_roi_on_bgr_po,
-	project_points_px,
-	project_points_px_masked,
-	plane_corners_world_from_overlay,
-	plane_poly_px_from_overlay,
-	roi_box_edges_px_from_overlay,
-	roi_mask_points_world,
-	roi_footprint_poly_px_from_overlay,
-	roi_box_edges_px_from_overlay_clipped,
-	clip_poly_points_to_image,
-)
-
-try:
-	from Communications.ipc import ControlListener, InterceptPublisher
-except Exception as e:
-	print(f"[IPC] Warning: could not import Communications.ipc ({e}). Running without IPC.")
-	ControlListener = None
-	InterceptPublisher = None
+from Ball_Tracking.graphics_objects import AspectImageView, FaintLogo, apply_dark_theme, make_card
+from Ball_Tracking.plane_math import _render_interest_region_from_cloud, overlay_plane_and_roi_on_bgr_po, colourise_depth
+from Communications.ipc import ControlListener, InterceptPublisher, InterceptSender
 
 # =========================== CONFIG ===========================
 SEND_TO_ARDUINO_DEFAULT = False
 SERIAL_PORT = "COM6"
 SERIAL_BAUD = 115200
 
-# Review capture
-PREBUFFER_SEC = 1.0
-POSTBUFFER_SEC = 1.0
-CAPTURE_KEEP_EVERY = 2
-REVIEW_OUT_DIR = "captures"
-REVIEW_PATH_HORIZON_S = 0.8
-
 # Catch plane (n·p + d = 0)
-CATCH_PLANE_Z_M = 1.20
-PLANE_NORMAL = (0.0, 0.0, 1.0)
-PLANE_D = -CATCH_PLANE_Z_M
-
-G_VECTOR = (0.0, 9.81, 0.0)
 BETA_DRAG = 0.02
 
 # Detection
 DEPTH_TOLERANCE_MM = 15
-SEARCH_RADIUS_PX = 200
 INIT_MIN_RADIUS_PX = 5
 INIT_SEARCH_CIRCLE_PX = 70
 
@@ -79,342 +47,7 @@ SEARCH_IM = "Assets/SEARCHING.png"
 PLANE_W = "Assets/PLANE_W.png"
 PLAY_W = "Assets/PLAY_W.png"
 WIZARD_W = "Assets/WIZARD_W.png"
-
 # ============================================================
-
-
-# ======================= EKF (with drag) ======================
-_EPS = 1e-9
-
-def _accel_with_drag(v: np.ndarray, g: np.ndarray, beta: float) -> np.ndarray:
-	s = np.linalg.norm(v)
-	return g - beta * s * v if s > _EPS else g.copy()
-
-def _jacobian_dvdt_dv(v: np.ndarray, beta: float) -> np.ndarray:
-	s = np.linalg.norm(v)
-	if s < _EPS:
-		return np.zeros((3,3))
-	I = np.eye(3)
-	return -beta * (s * I + np.outer(v, v) / s)
-
-def _f(x: np.ndarray, g: np.ndarray, beta: float) -> np.ndarray:
-	v = x[3:]
-	a = _accel_with_drag(v, g, beta)
-	return np.hstack((v, a))
-
-def _rk4_step(x: np.ndarray, dt: float, g: np.ndarray, beta: float) -> np.ndarray:
-	k1 = _f(x, g, beta)
-	k2 = _f(x + 0.5*dt*k1, g, beta)
-	k3 = _f(x + 0.5*dt*k2, g, beta)
-	k4 = _f(x + dt*k3, g, beta)
-	return x + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
-
-class EKF3DDrag:
-	"""x=[px,py,pz,vx,vy,vz]. Process: ṗ=v, v̇=g-β||v||v. Measurement: position (m)."""
-	def __init__(self, dt=EKF_DT, g=G_VECTOR, beta_drag=BETA_DRAG, Q_pos=Q_POS, Q_vel=Q_VEL, R_xyz=R_XYZ):
-		self.n = 6
-		self.dt = float(dt)
-		self.g = np.asarray(g, float).reshape(3)
-		self.beta_drag = float(beta_drag)
-		self.x = np.zeros(self.n, float)
-		self.P = np.diag([1e-2]*3 + [1e-1]*3).astype(float)
-		self.Q = np.diag([Q_pos]*3 + [Q_vel]*3).astype(float)
-		self.R = np.diag(R_xyz).astype(float)
-		self.H = np.zeros((3, self.n), float); self.H[0,0]=self.H[1,1]=self.H[2,2]=1.0
-		self.I = np.eye(self.n).astype(float)
-
-	def initialize(self, p_xyz, v_xyz=None):
-		p = np.asarray(p_xyz, float).reshape(3)
-		v = np.zeros(3, float) if v_xyz is None else np.asarray(v_xyz, float).reshape(3)
-		self.x[:3], self.x[3:] = p, v
-
-	def predict(self):
-		dt = self.dt
-		x_prev = self.x.copy()
-		self.x = _rk4_step(self.x, dt, self.g, self.beta_drag)
-		F = np.eye(self.n)
-		F[0:3,3:6] = dt*np.eye(3)
-		J = _jacobian_dvdt_dv(x_prev[3:], self.beta_drag)
-		F[3:6,3:6] += dt*J
-		self.P = F @ self.P @ F.T + self.Q
-		return self.x.copy(), self.P.copy()
-
-	def update_xyz(self, z_xyz, gate_alpha=GATE_ALPHA):
-		z = np.asarray(z_xyz, float).reshape(3)
-		H, R = self.H, self.R
-		y = z - (H @ self.x)
-		S = H @ self.P @ H.T + R
-		if gate_alpha is not None:
-			try:
-				S_inv_y = np.linalg.solve(S, y.reshape(3,1))
-				d2 = (y.reshape(1,3) @ S_inv_y).item()
-			except np.linalg.LinAlgError:
-				d2 = float("inf")
-			# rough chisq thresholds for 3 dof
-			thresh = 11.345 if gate_alpha >= 0.99 else 7.815
-			if gate_alpha >= 0.997: thresh = 14.160
-			if d2 > thresh:
-				return self.x.copy(), self.P.copy(), d2, thresh
-		try:
-			K = self.P @ H.T @ np.linalg.inv(S)
-		except np.linalg.LinAlgError:
-			K = self.P @ H.T @ np.linalg.inv(S + 1e-9*np.eye(3))
-		self.x = self.x + K @ y
-		self.P = (self.I - K @ H) @ self.P
-		return self.x.copy(), self.P.copy(), None, None
-
-	def predict_intercept_with_plane(self, n, d, t_max=2.0, step=None):
-		if step is None: step = self.dt
-		n = np.asarray(n, float).reshape(3)
-		def phi(p): return float(n @ p + d)
-		t = 0.0; xi = self.x.copy()
-		p_prev = xi[:3].copy(); phi_prev = phi(p_prev)
-		while t < t_max:
-			x_next = _rk4_step(xi, step, self.g, self.beta_drag)
-			t_next = t + step
-			p_next = x_next[:3]; phi_next = phi(p_next)
-			if abs(phi_prev) < _EPS: return t, p_prev
-			if phi_prev * phi_next < 0.0:
-				a_t, a_x = t, xi.copy()
-				b_t, b_x = t_next, x_next.copy()
-				for _ in range(24):
-					m_t = 0.5*(a_t+b_t)
-					m_x = _rk4_step(a_x, (m_t-a_t), self.g, self.beta_drag)
-					if phi_prev * phi(m_x[:3]) <= 0.0:
-						b_t, b_x = m_t, m_x
-					else:
-						a_t, a_x = m_t, m_x
-				t_hit = 0.5*(a_t+b_t)
-				p_hit = _rk4_step(self.x.copy(), t_hit, self.g, self.beta_drag)[:3]
-				return t_hit, p_hit
-			t, xi = t_next, x_next
-			p_prev, phi_prev = p_next, phi_next
-		return None, None
-# ===============================================================
-
-
-# ==================== Utility / Display helpers ====================
-def apply_dark_theme(app: QtWidgets.QApplication):
-	app.setStyle("Fusion")
-	p = QtGui.QPalette()
-	# Window & panels
-	p.setColor(QtGui.QPalette.Window,        QtGui.QColor("#111317"))
-	p.setColor(QtGui.QPalette.Base,          QtGui.QColor("#0b0d11"))
-	p.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor("#0f1217"))
-	# Text
-	p.setColor(QtGui.QPalette.WindowText,    QtGui.QColor("#e5e7eb"))
-	p.setColor(QtGui.QPalette.Text,          QtGui.QColor("#e5e7eb"))
-	p.setColor(QtGui.QPalette.ButtonText,    QtGui.QColor("#e5e7eb"))
-	# Controls
-	p.setColor(QtGui.QPalette.Button,        QtGui.QColor("#141821"))
-	p.setColor(QtGui.QPalette.Highlight,     QtGui.QColor("#2563eb"))
-	p.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("#ffffff"))
-	app.setPalette(p)
-
-	app.setStyleSheet("""
-	QMainWindow { background: #111317; }
-	QWidget#controlPanel { background: #0f1217; }
-	QFrame.Card {
-		background: #141821; border: 1px solid #1f2937; border-radius: 10px;
-	}
-	QPushButton {
-		background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 6px 10px; color: #e5e7eb;
-	}
-	QPushButton:hover { background: #0f172a; }
-	QPushButton:checked { background: #1d2a4d; }
-	QCheckBox, QLabel { color: #e5e7eb; }
-	QLineEdit, QComboBox, QPlainTextEdit {
-		background: #0b0d11; border: 1px solid #1f2937; border-radius: 6px; color: #e5e7eb; padding: 4px 6px;
-	}
-	QSlider::groove:horizontal { height: 6px; background: #1f2937; border-radius: 3px; }
-	QSlider::handle:horizontal { background: #e5e7eb; width: 14px; margin: -5px 0; border-radius: 7px; }
-	QLabel#titleLabel { font-size: 22px; font-weight: 900; letter-spacing: 10px; color: #e5e7eb; }
-	""")
-
-class FaintLogo(QtWidgets.QLabel):
-	def __init__(self, path, max_width=180, opacity=0.10, align=QtCore.Qt.AlignCenter, parent=None):
-		super().__init__(parent)
-		self.setAlignment(align)
-		if os.path.exists(path):
-			pm = QtGui.QPixmap(path)
-			if not pm.isNull():
-				pm = pm.scaledToWidth(max_width, QtCore.Qt.SmoothTransformation)
-				self.setPixmap(pm)
-				eff = QtWidgets.QGraphicsOpacityEffect(self)
-				eff.setOpacity(opacity)
-				self.setGraphicsEffect(eff)
-
-def make_card(*widgets):
-	card = QtWidgets.QFrame()
-	card.setObjectName("Card")
-	card.setProperty("class", "Card")
-	layout = QtWidgets.QVBoxLayout(card)
-	layout.setContentsMargins(12, 12, 12, 12)
-	layout.setSpacing(8)
-	for w in widgets:
-		layout.addWidget(w)
-	return card
-
-def colourise_depth(depth_u16: np.ndarray,
-					depth_scale: float,
-					clip_mm=(400, 3000),  
-					use_auto_percentiles=False
-				) -> np.ndarray:
-
-	# Convert to millimetres (for D435, depth_scale~0.001 so this equals depth_u16)
-	depth_mm = depth_u16.astype(np.float32) * (depth_scale * 1000.0)
-	valid = depth_u16 > 0
-
-	# Choose visualization range
-	if use_auto_percentiles:
-		if valid.any():
-			lo = float(np.percentile(depth_mm[valid], 2))
-			hi = float(np.percentile(depth_mm[valid], 98))
-			if hi <= lo:   # fallback if scene is flat
-				lo, hi = 400.0, 3000.0
-		else:
-			lo, hi = 400.0, 3000.0
-	else:
-		lo, hi = clip_mm
-
-	# Clamp to [lo,hi] only on valid pixels
-	vis = np.zeros_like(depth_mm, dtype=np.float32)
-	if valid.any():
-		vis[valid] = np.clip(depth_mm[valid], lo, hi)
-
-	vis_u8 = np.zeros_like(depth_u16, dtype=np.uint8)
-	rng = (hi - lo)
-	if rng > 1e-6 and valid.any():
-		vis_u8[valid] = np.round(255.0 * (vis[valid] - lo) / rng).astype(np.uint8)
-
-	vis_bgr = cv2.applyColorMap(vis_u8, cv2.COLORMAP_JET)
-
-	# Make invalid pixels black (optional but helpful)
-	if valid.any():
-		vis_bgr[~valid] = (0, 0, 0)
-
-	return vis_bgr
-
-
-
-def predict_radius(calib_r_px, calib_depth_mm, current_depth_mm):
-	if current_depth_mm <= 0 or calib_depth_mm is None or calib_r_px is None:
-		return int(calib_r_px or INIT_SEARCH_CIRCLE_PX)
-	return int(calib_r_px * (calib_depth_mm / current_depth_mm))
-# ==================================================================
-
-
-# ===================== Review capture ==============
-class ReviewCapture:
-	def __init__(self, enabled: bool, fps: float, keep_every: int, depth_scale: float, intrinsics, out_dir: str):
-		self.enabled = enabled
-		self.keep_every = max(1, int(keep_every))
-		self.depth_scale = float(depth_scale)
-		self.intrinsics = intrinsics
-		self.fps = float(fps) / self.keep_every
-		self.pre_len = int(PREBUFFER_SEC * fps / self.keep_every)
-		self.post_len = int(POSTBUFFER_SEC * fps / self.keep_every)
-		self.prebuffer = deque(maxlen=self.pre_len)
-		self.meta_pre = deque(maxlen=self.pre_len)
-		self.active = False
-		self.frames = []
-		self.meta = []
-		self.counter = 0
-		self.out_dir = out_dir
-		os.makedirs(self.out_dir, exist_ok=True)
-
-	def _maybe_keep(self):
-		self.counter += 1
-		if self.counter >= self.keep_every:
-			self.counter = 0
-			return True
-		return False
-
-	def tick(self, depth_image_u16, meta_dict):
-		if not self.enabled: return
-		if not self._maybe_keep(): return
-		self.prebuffer.append(depth_image_u16.copy())
-		self.meta_pre.append(dict(meta_dict))
-
-		if self.active:
-			self.frames.append(depth_image_u16.copy())
-			self.meta.append(dict(meta_dict))
-
-	def start(self):
-		if not self.enabled or self.active: return
-		self.active = True
-		self.frames = list(self.prebuffer)
-		self.meta = list(self.meta_pre)
-
-	def stop_and_render(self):
-		if not (self.enabled and self.active):
-			self.active = False
-			return
-		timestamp = time.strftime("%Y%m%d_%H%M%S")
-		sess_dir = os.path.join(self.out_dir, f"session_{timestamp}")
-		os.makedirs(sess_dir, exist_ok=True)
-
-		video_path = os.path.join(sess_dir, "review.mp4")
-		meta_path = os.path.join(sess_dir, "meta.json")
-
-		with open(meta_path, "w", encoding="utf-8") as f:
-			json.dump(self.meta, f, indent=2)
-
-		if len(self.frames) > 0:
-			h, w = self.frames[0].shape
-			fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-			writer = cv2.VideoWriter(video_path, fourcc, self.fps, (w, h))
-			for depth_u16, m in zip(self.frames, self.meta):
-				frame_bgr = colourise_depth(depth_u16, self.depth_scale)
-				# Overlay: measured center / search circle
-				if m.get("meas_px") is not None:
-					cx, cy = m["meas_px"]
-					cv2.circle(frame_bgr, (int(cx), int(cy)), 5, (0,255,0), 2)
-				if m.get("pred_px") is not None:
-					cv2.circle(frame_bgr, (int(m["pred_px"][0]), int(m["pred_px"][1])),
-							SEARCH_RADIUS_PX, (255,255,255), 1, lineType=cv2.LINE_AA)
-				writer.write(frame_bgr)
-			writer.release()
-
-		print(f"[REVIEW] Saved {len(self.frames)} frames to {video_path}")
-		print(f"[REVIEW] Metadata saved to {meta_path}")
-
-		self.active = False
-		self.frames.clear(); self.meta.clear()
-# ==================================================================
-
-
-# ===================== Serial sender (same format) =================
-class InterceptSender:
-	"""Sends ASCII: (TRACK,x_mm,y_mm,t_ms)\n"""
-	def __init__(self, enabled: bool, port: str, baud: int):
-		self.enabled = bool(enabled) and (serial is not None)
-		self.port = port; self.baud = baud; self.ser = None
-		if self.enabled:
-			try:
-				self.ser = serial.Serial(self.port, self.baud, timeout=0.01)
-				time.sleep(0.1)
-				print(f"[Serial] Opened {self.port} @ {self.baud}")
-			except Exception as e:
-				print(f"[Serial] ERROR opening {self.port}: {e}")
-				self.enabled = False
-
-	def send(self, x_m: float, y_m: float, t_s: float):
-		x_mm = int(round(1000*x_m)); y_mm = int(round(1000*y_m))
-		t_ms = max(0, int(round(1000*t_s)))
-		msg = f"(TRACK,{x_mm},{y_mm},{t_ms})\n"
-		if self.enabled and self.ser:
-			try: self.ser.write(msg.encode("ascii"))
-			except Exception as e: print(f"[Serial] write failed: {e} :: {msg.strip()}")
-		else:
-			print(f"[TRACK] x_mm={x_mm} y_mm={y_mm} t_ms={t_ms}")
-
-	def close(self):
-		try:
-			if self.ser and self.ser.is_open:
-				self.ser.close()
-		except Exception: pass
-# ==================================================================
 
 
 # =================== Core tracking worker (QThread) ===============
@@ -453,12 +86,7 @@ class CameraWorker(QtCore.QThread):
 		self.holes = None
 
 		# Interest region controls
-		self.roi_x_extend = 2.0
-		self.roi_z_extend = 10.0
-		self.roi_mirror_x = True  
-		self.roi_mirror_z = False  
-		self.roi_y_min = 0.00
-		self.roi_y_max = 5.0
+		self.roi_dict = {}
 
 		# Plane setup
 		self.search_box = None
@@ -476,9 +104,9 @@ class CameraWorker(QtCore.QThread):
 		self.draw_table_plane = True
 		self.colour_roi = False
 
-		self.plane_overlay = None   # dict with keys: p0,u,v,width_m,length_m,visible,invert_y
-		self.plane_n = np.array(PLANE_NORMAL, float).reshape(3)
-		self.plane_d = float(PLANE_D)
+		self.plane_overlay = None
+		self.plane_n = None
+		self.plane_d = None
 
 		# IPC / authority
 		self.ctrl = ControlListener() if ControlListener else None
@@ -523,16 +151,6 @@ class CameraWorker(QtCore.QThread):
 		except Exception:
 			pass
 		self.serial_sender = InterceptSender(self.send_to_arduino, SERIAL_PORT, SERIAL_BAUD)
-	
-	def _qimage_from_bgr(self, bgr: np.ndarray):
-		# bgr is HxWx3 uint8
-		rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-		h, w, _ = rgb.shape
-		return QtGui.QImage(rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888).copy()
-
-	def set_crop(self, top, bottom, left, right):
-		self.crop_top, self.crop_bottom = float(top), float(bottom)
-		self.crop_left, self.crop_right = float(left), float(right)
 	
 	def _valid_frame(self, f):
 		return (f is not None) and getattr(f, "is_frame", lambda: False)()
@@ -598,10 +216,8 @@ class CameraWorker(QtCore.QThread):
 			self.review = ReviewCapture(
 				enabled=self.enable_record,
 				fps=1.0/EKF_DT,
-				keep_every=CAPTURE_KEEP_EVERY,
 				depth_scale=self.depth_scale,
-				intrinsics=self.intrinsics,
-				out_dir=REVIEW_OUT_DIR
+				intrinsics=self.intrinsics
 			)
 
 			# EXPLORE LATER
@@ -829,18 +445,15 @@ class CameraWorker(QtCore.QThread):
 						cloud = cloud[m]
 					except Exception:
 						cloud = None
-
-				depth = self._render_interest_region_from_cloud(depth_u16, self.intrinsics, cloud) \
+				
+				po = self.plane_overlay
+				depth = _render_interest_region_from_cloud(depth_u16, self.intrinsics, cloud, po, self.depth_scale,
+													self.roi_dict) \
 						if self.colour_roi else colourise_depth(depth_u16, self.depth_scale)
 
-				po = self.plane_overlay
 				if po and (self.draw_table_plane or self.draw_interest_region):
 					show_bgr = overlay_plane_and_roi_on_bgr_po(
-						depth, self.intrinsics, po,
-						self.roi_y_min, self.roi_y_max,
-						self.roi_x_extend, self.roi_z_extend,
-						self.roi_mirror_x, self.roi_mirror_z,
-						self.draw_table_plane, self.draw_interest_region)
+						depth, self.intrinsics, po, self.roi_dict, self.draw_table_plane, self.draw_interest_region)
 				else:
 					show_bgr = depth
 
@@ -861,13 +474,13 @@ class CameraWorker(QtCore.QThread):
 					except Exception:
 						cloud = None
 
-				depth_img = self._render_interest_region_from_cloud(depth_u16, self.intrinsics, cloud) \
-							if self.colour_roi else colourise_depth(depth_u16, self.depth_scale)
+				depth_img = _render_interest_region_from_cloud(depth_u16, self.intrinsics, cloud, po, self.depth_scale,
+													self.roi_dict) \
+						if self.colour_roi else colourise_depth(depth_u16, self.depth_scale)
 
 				po = self.plane_overlay
 				if po and (self.draw_table_plane or self.draw_interest_region):
-					d = overlay_plane_and_roi_on_bgr_po(depth_img, self.intrinsics, po, self.roi_y_min, self.roi_y_max,
-													self.roi_x_extend, self.roi_z_extend, self.roi_mirror_x, self.roi_mirror_z, self.draw_table_plane, self.draw_interest_region)
+					d = overlay_plane_and_roi_on_bgr_po(depth_img, self.intrinsics, po, self.roi_dict, self.draw_table_plane, self.draw_interest_region)
 				else:
 					d = depth_img
 
@@ -876,8 +489,7 @@ class CameraWorker(QtCore.QThread):
 					c_raw = self._as_np(colour_frame)
 					if c_raw is not None:
 						if po and (self.draw_table_plane or self.draw_interest_region) and self.color_intrinsics is not None:
-							c = overlay_plane_and_roi_on_bgr_po(c_raw, self.color_intrinsics, po,self.roi_y_min, self.roi_y_max,
-													self.roi_x_extend, self.roi_z_extend, self.roi_mirror_x, self.roi_mirror_z, self.draw_table_plane, self.draw_interest_region)
+							c = overlay_plane_and_roi_on_bgr_po(c_raw, self.color_intrinsics, po, self.roi_dict, self.draw_table_plane, self.draw_interest_region)
 						else:
 							c = c_raw
 
@@ -889,13 +501,7 @@ class CameraWorker(QtCore.QThread):
 					continue
 				po = self.plane_overlay
 				if po and (self.draw_table_plane or self.draw_interest_region) and self.color_intrinsics is not None:
-					c = overlay_plane_and_roi_on_bgr_po(
-						c_raw, self.color_intrinsics, po,
-						self.roi_y_min, self.roi_y_max,
-						self.roi_x_extend, self.roi_z_extend,
-						self.roi_mirror_x, self.roi_mirror_z,
-						self.draw_table_plane, self.draw_interest_region, 0.25
-					)
+					c = overlay_plane_and_roi_on_bgr_po( c_raw, self.color_intrinsics, po, self.roi_dict, self.draw_table_plane, self.draw_interest_region, 0.25)
 				else:
 					c = c_raw
 				h, w = c.shape[:2]
@@ -940,103 +546,103 @@ class CameraWorker(QtCore.QThread):
 
 
 				# ===== Tracking =====
-				if not self.detected:
-					info = self._global_detect(depth_u16)
-					if info is not None:
-						(cx, cy), r_px, depth_m = info
-						self.ball_depth_mm = depth_m * 1000.0
-						self.calib_radius_px = r_px
-						self.calib_depth_mm = self.ball_depth_mm
+				# if not self.detected:
+				# 	info = self._global_detect(depth_u16)
+				# 	if info is not None:
+				# 		(cx, cy), r_px, depth_m = info
+				# 		self.ball_depth_mm = depth_m * 1000.0
+				# 		self.calib_radius_px = r_px
+				# 		self.calib_depth_mm = self.ball_depth_mm
 
-						p3d = rs.rs2_deproject_pixel_to_point(self.intrinsics, [float(cx), float(cy)], float(depth_m))
-						p3d = np.asarray(p3d, float)
-						self.ekf = EKF3DDrag(dt=EKF_DT, g=G_VECTOR, beta_drag=BETA_DRAG, Q_pos=Q_POS, Q_vel=Q_VEL, R_xyz=R_XYZ)
-						self.ekf.initialize(p3d, v_xyz=None)
+				# 		p3d = rs.rs2_deproject_pixel_to_point(self.intrinsics, [float(cx), float(cy)], float(depth_m))
+				# 		p3d = np.asarray(p3d, float)
+				# 		self.ekf = EKF3DDrag(dt=EKF_DT, g=G_VECTOR, beta_drag=BETA_DRAG, Q_pos=Q_POS, Q_vel=Q_VEL, R_xyz=R_XYZ)
+				# 		self.ekf.initialize(p3d, v_xyz=None)
 
-						self.ball_centers_px = [(cx, cy)]
-						self.detected = True
-						self.undetected_count = 0
+				# 		self.ball_centers_px = [(cx, cy)]
+				# 		self.detected = True
+				# 		self.undetected_count = 0
 
-						if self.enable_record:
-							self.review.start()
+				# 		if self.enable_record:
+				# 			self.review.start()
 
-						meta["meas_px"] = (cx, cy)
-						meta["state"] = self.ekf.x.tolist()
-						self.event.emit(f"Ball detected at ({cx},{cy})")
+				# 		meta["meas_px"] = (cx, cy)
+				# 		meta["state"] = self.ekf.x.tolist()
+				# 		self.event.emit(f"Ball detected at ({cx},{cy})")
 
-						if show_bgr is not None:
-							cv2.circle(show_bgr, (cx, cy), int(r_px), (0,255,0), 2)
-					else:
-						pass
-				else:
-					# Predict
-					self.ekf.predict()
-					p_pred = self.ekf.x[:3].tolist()
-					try:
-						pred_px = rs.rs2_project_point_to_pixel(self.intrinsics, p_pred)
-					except Exception:
-						pred_px = self.ball_centers_px[-1] if self.ball_centers_px else (w//2, h//2)
-					pred_px = (int(np.clip(pred_px[0],0,w-1)), int(np.clip(pred_px[1],0,h-1)))
-					meta["pred_px"] = pred_px
-					meta["state"] = self.ekf.x.tolist()
+				# 		if show_bgr is not None:
+				# 			cv2.circle(show_bgr, (cx, cy), int(r_px), (0,255,0), 2)
+				# 	else:
+				# 		pass
+				# else:
+				# 	# Predict
+				# 	self.ekf.predict()
+				# 	p_pred = self.ekf.x[:3].tolist()
+				# 	try:
+				# 		pred_px = rs.rs2_project_point_to_pixel(self.intrinsics, p_pred)
+				# 	except Exception:
+				# 		pred_px = self.ball_centers_px[-1] if self.ball_centers_px else (w//2, h//2)
+				# 	pred_px = (int(np.clip(pred_px[0],0,w-1)), int(np.clip(pred_px[1],0,h-1)))
+				# 	meta["pred_px"] = pred_px
+				# 	meta["state"] = self.ekf.x.tolist()
 
-					exp_r_px = predict_radius(self.calib_radius_px, self.calib_depth_mm, self.ball_depth_mm or (self.calib_depth_mm or 1000.0))
-					centre_info, depth_mm_found = self._focus_detect(
-						depth_u16, self.ball_depth_mm or self.calib_depth_mm or 1000.0,
-						exp_r_px, pred_px
-					)
+				# 	exp_r_px = predict_radius(self.calib_radius_px, self.calib_depth_mm, self.ball_depth_mm or (self.calib_depth_mm or 1000.0))
+				# 	centre_info, depth_mm_found = self._focus_detect(
+				# 		depth_u16, self.ball_depth_mm or self.calib_depth_mm or 1000.0,
+				# 		exp_r_px, pred_px
+				# 	)
 
-					if centre_info is not None and depth_mm_found is not None:
-						cx, cy = centre_info
-						depth_m = depth_mm_found / 1000.0
-						meas_p3d = rs.rs2_deproject_pixel_to_point(self.intrinsics, [float(cx), float(cy)], float(depth_m))
-						meas_p3d = np.asarray(meas_p3d, float)
-						self.ekf.update_xyz(meas_p3d, gate_alpha=GATE_ALPHA)
+				# 	# if centre_info is not None and depth_mm_found is not None:
+				# 	# 	cx, cy = centre_info
+				# 	# 	depth_m = depth_mm_found / 1000.0
+				# 	# 	meas_p3d = rs.rs2_deproject_pixel_to_point(self.intrinsics, [float(cx), float(cy)], float(depth_m))
+				# 	# 	meas_p3d = np.asarray(meas_p3d, float)
+				# 	# 	self.ekf.update_xyz(meas_p3d, gate_alpha=GATE_ALPHA)
 
-						self.ball_depth_mm = depth_mm_found
-						self.ball_centers_px.append((cx, cy)); self.ball_centers_px = self.ball_centers_px[-2:]
-						self.undetected_count = 0
+				# 	# 	self.ball_depth_mm = depth_mm_found
+				# 	# 	self.ball_centers_px.append((cx, cy)); self.ball_centers_px = self.ball_centers_px[-2:]
+				# 	# 	self.undetected_count = 0
 
-						# Intercept + comms
-						n_use = np.asarray(self.plane_n, float).reshape(3) if self.plane_n is not None else np.asarray(PLANE_NORMAL, float)
-						d_use = float(self.plane_d) if self.plane_d is not None else float(PLANE_D)
-						t_hit, p_hit = self.ekf.predict_intercept_with_plane(n_use, d_use, t_max=2.0)
+				# 	# 	# Intercept + comms
+				# 	# 	n_use = np.asarray(self.plane_n, float).reshape(3) if self.plane_n is not None else np.asarray(PLANE_NORMAL, float)
+				# 	# 	d_use = float(self.plane_d) if self.plane_d is not None else float(PLANE_D)
+				# 	# 	t_hit, p_hit = self.ekf.predict_intercept_with_plane(n_use, d_use, t_max=2.0)
 
-						if t_hit is not None and p_hit is not None:
-							now = time.time()
-							# Publish to SIM (rate-limited)
-							if (authority == "LIVE") and self.itc_pub and (now - self.last_pub_ts) >= IPC_MIN_PERIOD_S:
-								try:
-									self.itc_pub.publish(x_mm=float(p_hit[0])*1000.0,
-														y_mm=float(p_hit[1])*1000.0,
-														t_hit_s=float(t_hit),
-														source="tracker")
-									self.last_pub_ts = now
-								except Exception as e:
-									self.event.emit(f"[IPC] publish failed: {e}")
+				# 	# 	if t_hit is not None and p_hit is not None:
+				# 	# 		now = time.time()
+				# 	# 		# Publish to SIM (rate-limited)
+				# 	# 		if (authority == "LIVE") and self.itc_pub and (now - self.last_pub_ts) >= IPC_MIN_PERIOD_S:
+				# 	# 			try:
+				# 	# 				self.itc_pub.publish(x_mm=float(p_hit[0])*1000.0,
+				# 	# 									y_mm=float(p_hit[1])*1000.0,
+				# 	# 									t_hit_s=float(t_hit),
+				# 	# 									source="tracker")
+				# 	# 				self.last_pub_ts = now
+				# 	# 			except Exception as e:
+				# 	# 				self.event.emit(f"[IPC] publish failed: {e}")
 
-							# Arduino (only in LIVE and if enabled)
-							if (authority == "LIVE") and self.send_to_arduino:
-								self.serial_sender.send(p_hit[0], p_hit[1], t_hit)
+				# 	# 		# Arduino (only in LIVE and if enabled)
+				# 	# 		if (authority == "LIVE") and self.send_to_arduino:
+				# 	# 			self.serial_sender.send(p_hit[0], p_hit[1], t_hit)
 
-							meta["intercept_t"] = float(t_hit)
-							meta["intercept_xyz"] = [float(p_hit[0]), float(p_hit[1]), float(p_hit[2])]
+				# 	# 		meta["intercept_t"] = float(t_hit)
+				# 	# 		meta["intercept_xyz"] = [float(p_hit[0]), float(p_hit[1]), float(p_hit[2])]
 
-						meta["meas_px"] = (cx, cy)
+				# 	# 	meta["meas_px"] = (cx, cy)
 
-						if show_bgr is not None and self.view_mode != "Fast":
-							cv2.circle(show_bgr, (cx, cy), int(exp_r_px), (0,255,0), 2)
-							cv2.circle(show_bgr, pred_px, SEARCH_RADIUS_PX, (255,255,255), 1, lineType=cv2.LINE_AA)
-					else:
-						self.undetected_count += 1
-						if self.undetected_count > 10:
-							if self.enable_record and self.review.active:
-								self.review.stop_and_render()
-							self.detected = False
-							self.ekf = None
-							self.ball_centers_px.clear()
-							self.undetected_count = 0
-							self.event.emit("Ball lost.")
+				# 	# 	if show_bgr is not None and self.view_mode != "Fast":
+				# 	# 		cv2.circle(show_bgr, (cx, cy), int(exp_r_px), (0,255,0), 2)
+				# 	# 		cv2.circle(show_bgr, pred_px, SEARCH_RADIUS_PX, (255,255,255), 1, lineType=cv2.LINE_AA)
+				# 	# else:
+				# 	# 	self.undetected_count += 1
+				# 	# 	if self.undetected_count > 10:
+				# 	# 		if self.enable_record and self.review.active:
+				# 	# 			self.review.stop_and_render()
+				# 	# 		self.detected = False
+				# 	# 		self.ekf = None
+				# 	# 		self.ball_centers_px.clear()
+				# 	# 		self.undetected_count = 0
+				# 	# 		self.event.emit("Ball lost.")
 
 				# Review tick
 				if self.enable_record:
@@ -1114,312 +720,11 @@ class CameraWorker(QtCore.QThread):
 		# 	p0[1] *= -1.0; u[1] *= -1.0; v[1] *= -1.0
 
 		return p0, u, v, w, l
-	
-	def _roi_box_vertices_3d(self, p0, u, v, n, w, l, hmin, hmax):
-		base = self._roi_corners_3d(p0, u, v, w, l)  # 4x3
-		bottom = base + n[None, :] * float(hmin)
-		top    = base + n[None, :] * float(hmax)
-		return np.vstack([bottom, top])  # 8x3
-
-	def _project_points_px(self, pts3d):
-		"""Project Nx3 -> Nx2 pixel coords (int)."""
-		pts2d = [rs.rs2_project_point_to_pixel(self.intrinsics, p.astype(float).tolist()) for p in pts3d]
-		return np.array([[int(p[0]), int(p[1])] for p in pts2d], np.int32)
-
-	def _draw_roi_box_edges(self, img_bgr, verts3d, thickness=2):
-		if img_bgr is None: 
-			return img_bgr
-
-		verts2d = self._project_points_px(verts3d)
-		dists = np.linalg.norm(verts3d, axis=1)  # distance from camera (approx)
-		dmin, dmax = float(np.min(dists)), float(np.max(dists))
-
-		def edge_col(i, j):
-			d = 0.5*(dists[i] + dists[j])
-			t = 0.5 if (dmax <= dmin + 1e-9) else (d - dmin) / (dmax - dmin)
-			val = int(round(200*(1.0 - t) + 60*t))  # near=bright(200), far=dim(60)
-			return (val, val, val)
-
-		edges = [
-			(0,1),(1,2),(2,3),(3,0),     # bottom loop
-			(4,5),(5,6),(6,7),(7,4),     # top loop
-			(0,4),(1,5),(2,6),(3,7)      # pillars
-		]
-		for i, j in edges:
-			p1, p2 = tuple(verts2d[i]), tuple(verts2d[j])
-			cv2.line(img_bgr, p1, p2, edge_col(i, j), thickness, lineType=cv2.LINE_AA)
-
-		return img_bgr
-
-	def _overlay_plane_on_depth(self, depth_bgr):
-		try:
-			if depth_bgr is None or self.intrinsics is None:
-				return depth_bgr
-			po = self.plane_overlay
-			if not po or not self.draw_table_plane:
-				return depth_bgr
-
-			poly = plane_poly_px_from_overlay(po, self.intrinsics)  # (4,2) int32
-			h, wimg = depth_bgr.shape[:2]
-			poly[:,0] = np.clip(poly[:,0], 0, wimg-1)
-			poly[:,1] = np.clip(poly[:,1], 0, h-1)
-
-			out = depth_bgr.copy()
-			overlay = depth_bgr.copy()
-			cv2.fillPoly(overlay, [poly], color=(200, 255, 255), lineType=cv2.LINE_AA)
-			out = cv2.addWeighted(overlay, 0.15, out, 0.85, 0.0)
-			cv2.polylines(out, [poly], isClosed=True, color=(200, 255, 255), thickness=2, lineType=cv2.LINE_AA)
-			return out
-		except Exception:
-			return depth_bgr
-	
-	def _roi_corners_3d(self, p0, u, v, w, l):
-
-		hx, hz = 0.5*w, 0.5*l
-		ex = float(self.roi_x_extend)
-		ez = float(self.roi_z_extend)
-
-		# X (along u)
-		if self.roi_mirror_x:
-			hx_min = hx + abs(ex)
-			hx_max = hx + abs(ex)
-			neg_push_x = 0.0; pos_push_x = 0.0
-		else:
-			hx_min = hx; hx_max = hx
-			neg_push_x = abs(ex) if ex < 0 else 0.0  # extend -u side
-			pos_push_x = abs(ex) if ex > 0 else 0.0  # extend +u side
-
-		# Z (along v)
-		if self.roi_mirror_z:
-			hz_min = hz + abs(ez)
-			hz_max = hz + abs(ez)
-			neg_push_z = 0.0; pos_push_z = 0.0
-		else:
-			hz_min = hz; hz_max = hz
-			neg_push_z = abs(ez) if ez < 0 else 0.0  # extend -v side
-			pos_push_z = abs(ez) if ez > 0 else 0.0  # extend +v side
-
-		# Corners
-		c00 = p0 + (-(hx_min + neg_push_x))*u + (-(hz_min + neg_push_z))*v
-		c10 = p0 + ( +(hx_max + pos_push_x))*u + (-(hz_min + neg_push_z))*v
-		c11 = p0 + ( +(hx_max + pos_push_x))*u + ( +(hz_max + pos_push_z))*v
-		c01 = p0 + (-(hx_min + neg_push_x))*u + ( +(hz_max + pos_push_z))*v
-		return np.stack([c00, c10, c11, c01], axis=0)
-
-	def _roi_polygon_px(self, p0, u, v, w, l):
-		corners_3d = self._roi_corners_3d(p0, u, v, w, l)
-		pts = [rs.rs2_project_point_to_pixel(self.intrinsics, c.astype(float).tolist())
-			for c in corners_3d]
-		return np.array([[int(p[0]), int(p[1])] for p in pts], np.int32), corners_3d
-	
-	# def _render_interest_region(self, depth_u16, base_bgr=None):
-
-	# 	po = self.plane_overlay
-	# 	if (self.intrinsics is None) or (po is None):
-	# 		return base_bgr if base_bgr is not None else None
-
-	# 	# Plane basis
-	# 	p0 = np.asarray(po["p0"], float)
-	# 	u  = np.asarray(po["u"],  float); u /= (np.linalg.norm(u)+1e-12)
-	# 	v  = np.asarray(po["v"],  float); v /= (np.linalg.norm(v)+1e-12)
-	# 	n = np.asarray(po["normal"], float)
-	# 	w  = float(po.get("width_m", 0.7))
-	# 	l  = float(po.get("length_m", 0.7))
-
-	# 	# Height band relative to plane (meters)
-	# 	hmin = float(self.roi_y_min)
-	# 	hmax = float(self.roi_y_max)
-
-	# 	# Prepare the background image
-	# 	if self.colour_roi:
-	# 		# Grey from depth_u16 (simple linear map on valid pixels)
-	# 		depth_mm = depth_u16.astype(np.float32) * (self.depth_scale * 1000.0)
-	# 		valid = depth_u16 > 0
-	# 		if valid.any():
-	# 			lo = float(np.percentile(depth_mm[valid], 2))
-	# 			hi = float(np.percentile(depth_mm[valid], 98))
-	# 			if hi <= lo: lo, hi = 400.0, 3000.0
-	# 		else:
-	# 			lo, hi = 400.0, 3000.0
-
-	# 		norm = np.zeros_like(depth_mm, np.float32)
-	# 		if valid.any():
-	# 			norm[valid] = np.clip((depth_mm[valid] - lo) / (hi - lo + 1e-6), 0, 1)
-	# 		grey_u8 = (norm * 255.0).astype(np.uint8)
-	# 		out = cv2.cvtColor(grey_u8, cv2.COLOR_GRAY2BGR)
-	# 		out[~valid] = (0,0,0)
-	# 	else:
-	# 		# Use whatever was already composed (e.g., JET + plane polygon)
-	# 		out = base_bgr.copy() if base_bgr is not None else None
-	# 		if out is None:
-	# 			# fallback to a quick JET if none provided
-	# 			out = colourise_depth(depth_u16, self.depth_scale)
-
-		
-	# 	h_img, w_img = depth_u16.shape
-	# 	poly_px = roi_footprint_poly_px_from_overlay(
-	# 		p0=p0, u=u, v=v, n=n,  # flipped only if you want image-layout-consistency
-	# 		width_m=w, length_m=l,
-	# 		x_extend=self.roi_x_extend, z_extend=self.roi_z_extend,
-	# 		mirror_x=self.roi_mirror_x, mirror_z=self.roi_mirror_z,
-	# 		intr=self.intrinsics
-	# 	)
-	# 	poly_px = clip_poly_points_to_image(poly_px, w_img, h_img)
-	# 	mask = np.zeros((h_img, w_img), np.uint8)
-	# 	cv2.fillPoly(mask, [poly_px], 255)
-
-	# 	# Vectorised deprojection only for masked pixels
-	# 	ys, xs = np.nonzero(mask)
-	# 	if xs.size > 0:
-	# 		fx, fy = self.intrinsics.fx, self.intrinsics.fy
-	# 		cx, cy = self.intrinsics.ppx, self.intrinsics.ppy
-	# 		z_m = depth_u16[ys, xs].astype(np.float32) * self.depth_scale
-	# 		valid = z_m > 0
-	# 		if np.any(valid):
-	# 			xs = xs[valid]; ys = ys[valid]; z_m = z_m[valid]
-	# 			X = (xs - cx) * z_m / fx
-	# 			Y = (ys - cy) * z_m / fy
-	# 			Z = z_m
-	# 			P = np.stack([X, Y, Z], axis=1)
-
-	# 			# height above plane: h = n·(P - p0)
-	# 			h = (P - p0[None, :]) @ n
-	# 			in_band = (h >= hmin) & (h <= hmax)
-
-	# 			if self.colour_roi:
-	# 				# Bright green for in-band pixels; background stays grey
-	# 				out[ys[in_band], xs[in_band]] = (0, 255, 80)
-	# 			else:
-	# 				# Optional light tint inside band (comment out to keep pure JET)
-	# 				pass
-
-	# 	return out
-
-	def _render_interest_region_from_cloud(self, depth_u16, intr, xyz_full):
-
-		# Basic guards
-		if depth_u16 is None or intr is None or xyz_full is None or xyz_full.size == 0:
-			return colourise_depth(depth_u16, self.depth_scale)
-
-		# --- Background image: always make BGR ---
-		if self.colour_roi:
-			# fast greyscale from depth (mm), then to BGR
-			depth_mm = depth_u16.astype(np.float32) * (self.depth_scale * 1000.0)
-			valid = depth_u16 > 0
-			if valid.any():
-				lo = float(np.percentile(depth_mm[valid], 2))
-				hi = float(np.percentile(depth_mm[valid], 98))
-				if hi <= lo:
-					lo, hi = 400.0, 3000.0
-			else:
-				lo, hi = 400.0, 3000.0
-			norm = np.zeros_like(depth_mm, np.float32)
-			if valid.any():
-				norm[valid] = np.clip((depth_mm[valid] - lo) / (hi - lo + 1e-6), 0, 1)
-			grey_u8 = (norm * 255.0).astype(np.uint8)
-			out = cv2.cvtColor(grey_u8, cv2.COLOR_GRAY2BGR)
-			out[~valid] = (0, 0, 0)
-		else:
-			# fallback to standard colourised depth
-			out = colourise_depth(depth_u16, self.depth_scale)
-
-		h, w = out.shape[:2]
-
-		# --- Plane/ROI params (canonical world frame; DO NOT invert normal here) ---
-		po = self.plane_overlay
-		if not po:
-			return out
-		p0 = np.asarray(po["p0"], float)
-		u  = np.asarray(po["u"],  float)
-		v  = np.asarray(po["v"],  float)
-		n  = np.asarray(po["normal"], float)
-
-		width_m  = float(po.get("width_m",  0.7))
-		length_m = float(po.get("length_m", 0.7))
-
-		# --- World-space ROI mask over full cloud ---
-		inside_full = roi_mask_points_world(
-			xyz_full, p0, u, v, n,
-			width_m, length_m,
-			self.roi_y_min, self.roi_y_max,
-			self.roi_x_extend, self.roi_z_extend,
-			self.roi_mirror_x, self.roi_mirror_z
-		)
-		if not inside_full.any():
-			return out
-
-		pts_in = xyz_full[inside_full]
-
-		# --- Project those ROI points to depth pixels (skip behind camera) ---
-		px, valid = project_points_px_masked(pts_in, intr)
-		px = px[valid]
-		if px.size == 0:
-			return out
-
-		# Build/clean a pixel mask
-		xs = np.clip(px[:, 0], 0, w - 1)
-		ys = np.clip(px[:, 1], 0, h - 1)
-		mask = np.zeros((h, w), np.uint8)
-		mask[ys, xs] = 255
-		k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-		mask = cv2.dilate(mask, k, iterations=1)
-		mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
-
-		# --- Green overlay (alpha blend) ---
-		overlay = out.copy()
-		overlay[mask > 0] = (0, 255, 0)
-		out = cv2.addWeighted(overlay, 0.35, out, 0.65, 0.0)
-
-		return out
-	
-
-	def _overlay_plane_and_roi_on_image(self, bgr: np.ndarray, intr, plane_overlay: dict, *, fill_alpha_rgb: bool=False) -> np.ndarray:
-		"""
-		Draw plane (filled poly + outline) and ROI wireframe on an image.
-		- fill_alpha_rgb=True -> use low alpha fill (intended for RGB); depth path can keep it too.
-		- ROI normal is inverted here for image overlays (requested behavior).
-		"""
-		if bgr is None or intr is None or not plane_overlay:
-			return bgr
-		out = bgr.copy()
-		h, w = out.shape[:2]
-
-		p0 = np.asarray(plane_overlay["p0"], float)
-		u  = np.asarray(plane_overlay["u"],  float)
-		v  = np.asarray(plane_overlay["v"],  float)
-		w_m  = float(plane_overlay.get("width_m", 0.7))
-		l_m  = float(plane_overlay.get("length_m", 0.7))
-		n = np.asarray(plane_overlay["normal"], float)
-	
-		# plane polygon
-		if self.draw_table_plane:
-			poly = plane_poly_px_from_overlay(p0=p0, u=u, v=v, width_m=w_m, length_m=l_m, intr=intr)
-			poly = clip_poly_points_to_image(poly, w, h)
-			if fill_alpha_rgb:
-				ov = out.copy()
-				cv2.fillPoly(ov, [poly], color=(200,255,255), lineType=cv2.LINE_AA)
-				out = cv2.addWeighted(ov, 0.15, out, 0.85, 0.0)
-			cv2.polylines(out, [poly], True, (200,255,255), 2, lineType=cv2.LINE_AA)
-
-		# ROI wireframe (clipped)
-		if self.draw_interest_region:
-			segs = roi_box_edges_px_from_overlay_clipped(
-				p0=p0, u=u, v=v, n=n, width_m=w_m, length_m=l_m, intr=intr,
-				y_min=self.roi_y_min, y_max=self.roi_y_max,
-				x_extend=self.roi_x_extend, z_extend=self.roi_z_extend,
-				mirror_x=self.roi_mirror_x, mirror_z=self.roi_mirror_z,
-				image_shape=out.shape
-			)
-			for (x0,y0),(x1,y1) in segs:
-				cv2.line(out, (x0,y0), (x1,y1), (180,180,180), 2, lineType=cv2.LINE_AA)
-
-		return out
 
 # ==================================================================
 
 
 # ========================== GUI main window =======================
-
 class MainWindow(QtWidgets.QMainWindow):
 	def __init__(self):
 		super().__init__()
@@ -1594,7 +899,7 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.chk_fast.toggled.connect(self._apply_streams)
 		self.send_chk.toggled.connect(self.worker.set_send_arduino)
 
-		self.btn_load_review.clicked.connect(self._load_review)
+		self.btn_load_review.clicked.connect(self._enter_review)
 		self.rec_chk.toggled.connect(self._on_toggle_record)
 
 		self.FAST_CARD = QtGui.QPixmap(FAST_IM)
@@ -1625,12 +930,11 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.on_event(f"Plane config: loaded {os.path.basename(chosen)}")
 
 		# Push plane overlay
-		pl = state.get("plane")
 		flags = state.get("flags", {})
 		invert_y = bool(flags.get("invert_y", True))
 		visible = bool(flags.get("plane_visible", True))
-		roi = state.get("roi", {})
 
+		pl = state.get("plane")
 		if pl:
 			po = {
 				"p0": pl.get("p0", [0,0,1]),
@@ -1643,13 +947,6 @@ class MainWindow(QtWidgets.QMainWindow):
 				"invert_y": invert_y,
 			}
 			self.worker.plane_overlay = po
-
-			self.worker.roi_x_extend = float(roi.get("x_extend", 0.0))
-			self.worker.roi_z_extend = float(roi.get("z_extend", 0.0))
-			self.worker.roi_mirror_x = bool(roi.get("mirror_x", False))
-			self.worker.roi_mirror_z = bool(roi.get("mirror_z", False))
-			self.worker.roi_y_min    = float(roi.get("y_min", 0.0))
-			self.worker.roi_y_max    = float(roi.get("y_max", 0.2))
 
 			n = np.asarray(pl.get("normal", [0,1,0]), float).reshape(3)
 			p0 = np.asarray(pl.get("p0", [0,0,1]), float).reshape(3)
@@ -1665,8 +962,19 @@ class MainWindow(QtWidgets.QMainWindow):
 			self.on_event(f"Plane set: n={n.round(3).tolist()}, d={d:.3f}, size=({po['width_m']:.3f},{po['length_m']:.3f})m, visible={po['visible']}")
 		else:
 			self.worker.plane_overlay = None
-			self.worker.plane_n = np.array(PLANE_NORMAL, float)
-			self.worker.plane_d = float(PLANE_D)
+			self.worker.plane_n = None
+			self.worker.plane_d = None
+
+		roi = state.get("roi", {})
+		if roi:
+			self.worker.roi_dict = {
+				"x_extend": float(roi.get("x_extend", 0.0)),
+				"z_extend": float(roi.get("z_extend", 0.0)),
+				"mirror_x": bool(roi.get("mirror_x", False)),
+				"mirror_z": bool(roi.get("mirror_z", False)),
+				"y_min": float(roi.get("y_min", 0.0)),
+				"y_max": float(roi.get("y_max", 0.2))
+			}
 
 	def _on_plane_cfg_changed(self, path):
 		# Re-arm watcher (Windows sometimes drops it after a change)
@@ -1677,13 +985,12 @@ class MainWindow(QtWidgets.QMainWindow):
 			pass
 		self._load_plane_from_json()
 
-	
 	def _enter_review(self, path: str):
-		if self.review_page.load_video(path):
-			self.worker.stop()        # stop live worker while reviewing
-			self.worker.wait(1500)
-			self.stack.setCurrentIndex(1)
-			self.findChild(QtWidgets.QDockWidget, "rightDock").hide()
+		# if self.review_page.load_video(path):
+		self.worker.stop()        # stop live worker while reviewing
+		self.worker.wait(1500)
+		self.stack.setCurrentIndex(1)
+		self.findChild(QtWidgets.QDockWidget, "rightDock").hide()
 
 	def _return_to_live(self):
 		# return to live
@@ -1746,16 +1053,6 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.worker.enable_record = self.rec_chk.isChecked()
 		if getattr(self.worker, "review", None):
 			self.worker.review.enabled = self.rec_chk.isChecked()
-
-	def _mk_slider(self, label, parent_layout):
-		row = QtWidgets.QHBoxLayout()
-		row.addWidget(QtWidgets.QLabel(label))
-		s = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-		s.setRange(0, 50)  # 0..50% of height/width
-		s.setSingleStep(1)
-		row.addWidget(s)
-		parent_layout.addLayout(row)
-		return s
 	
 	def _apply_streams(self):
 		want_fast  = self.chk_fast.isChecked()
@@ -1766,23 +1063,26 @@ class MainWindow(QtWidgets.QMainWindow):
 		self.chk_depth.setEnabled(not want_fast)
 		self.chk_rgb.setEnabled(not want_fast)
 
-		# if want_fast:
-		# 	self.video.setPixmap(self.FAST_CARD.scaled(self.video.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
-
 		# Request reconfigure in the worker thread
 		self.worker.request_reconfig(want_depth, want_rgb, want_fast)
 	
-	def resizeEvent(self, ev: QtGui.QResizeEvent):
-		super().resizeEvent(ev)
-		# Recompute the target drawing size only when the window/layout actually changes
-		self._video_target_size = self.video.size()
+	def _on_toggle_record(self, v):
+		v = bool(v)
+		self.worker.enable_record = v
 
+		# If the ReviewCapture object exists, flip its internal flag too
+		rc = getattr(self.worker, "review", None)
+		if rc is not None:
+			rc.enabled = v
+
+		self.on_event(f"Review capture {'ENABLED' if v else 'DISABLED'}")
+
+	#? HERE
 	@QtCore.pyqtSlot(QtGui.QImage)
 	def on_frame(self, qimg: QtGui.QImage):
 		# Just hand it to the view; it will repaint to current widget size
 		self.video.setImage(qimg)
 
-	# ---------- Live updates ----------
 	@QtCore.pyqtSlot(QtGui.QImage)
 	def on_frame(self, qimg):
 		if not hasattr(self, "_last_video_size"):
@@ -1810,27 +1110,12 @@ class MainWindow(QtWidgets.QMainWindow):
 	def on_event(self, msg):
 		ts = time.strftime("%H:%M:%S")
 		self.log.appendPlainText(f"[{ts}] {msg}")
-
-	# ---------- Review playback ----------
-	def _load_review(self):
-		path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open review.mp4", REVIEW_OUT_DIR, "MP4 files (*.mp4)")
-		if not path:
-			return
-		self.on_event(f"Loaded review: {path}")
-		self._enter_review(path)
-	
-	def _on_toggle_record(self, v):
-		v = bool(v)
-		self.worker.enable_record = v
-
-		# If the ReviewCapture object exists, flip its internal flag too
-		rc = getattr(self.worker, "review", None)
-		if rc is not None:
-			rc.enabled = v
-
-		self.on_event(f"Review capture {'ENABLED' if v else 'DISABLED'}")
 	
 
+# def predict_radius(calib_r_px, calib_depth_mm, current_depth_mm):
+# 	if current_depth_mm <= 0 or calib_depth_mm is None or calib_r_px is None:
+# 		return int(calib_r_px or INIT_SEARCH_CIRCLE_PX)
+# 	return int(calib_r_px * (calib_depth_mm / current_depth_mm))
 
 def main():
 	app = QtWidgets.QApplication(sys.argv)

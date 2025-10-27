@@ -354,3 +354,81 @@ def _colored_span(label, color_key, rng, init):
 	spn.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons); spn.setFixedWidth(60)
 	hl.addWidget(lab); hl.addWidget(spn)
 	return wrap, spn
+
+def apply_dark_theme(app: QtWidgets.QApplication):
+	app.setStyle("Fusion")
+	p = QtGui.QPalette()
+	# Window & panels
+	p.setColor(QtGui.QPalette.Window,        QtGui.QColor("#111317"))
+	p.setColor(QtGui.QPalette.Base,          QtGui.QColor("#0b0d11"))
+	p.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor("#0f1217"))
+	# Text
+	p.setColor(QtGui.QPalette.WindowText,    QtGui.QColor("#e5e7eb"))
+	p.setColor(QtGui.QPalette.Text,          QtGui.QColor("#e5e7eb"))
+	p.setColor(QtGui.QPalette.ButtonText,    QtGui.QColor("#e5e7eb"))
+	# Controls
+	p.setColor(QtGui.QPalette.Button,        QtGui.QColor("#141821"))
+	p.setColor(QtGui.QPalette.Highlight,     QtGui.QColor("#2563eb"))
+	p.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("#ffffff"))
+	app.setPalette(p)
+
+	app.setStyleSheet("""
+	QMainWindow { background: #111317; }
+	QWidget#controlPanel { background: #0f1217; }
+	QFrame.Card {
+		background: #141821; border: 1px solid #1f2937; border-radius: 10px;
+	}
+	QPushButton {
+		background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 6px 10px; color: #e5e7eb;
+	}
+	QPushButton:hover { background: #0f172a; }
+	QPushButton:checked { background: #1d2a4d; }
+	QCheckBox, QLabel { color: #e5e7eb; }
+	QLineEdit, QComboBox, QPlainTextEdit {
+		background: #0b0d11; border: 1px solid #1f2937; border-radius: 6px; color: #e5e7eb; padding: 4px 6px;
+	}
+	QSlider::groove:horizontal { height: 6px; background: #1f2937; border-radius: 3px; }
+	QSlider::handle:horizontal { background: #e5e7eb; width: 14px; margin: -5px 0; border-radius: 7px; }
+	QLabel#titleLabel { font-size: 22px; font-weight: 900; letter-spacing: 10px; color: #e5e7eb; }
+	""")
+
+class FaintLogo(QtWidgets.QLabel):
+	def __init__(self, path, max_width=180, opacity=0.10, align=QtCore.Qt.AlignCenter, parent=None):
+		super().__init__(parent)
+		self.setAlignment(align)
+		if os.path.exists(path):
+			pm = QtGui.QPixmap(path)
+			if not pm.isNull():
+				pm = pm.scaledToWidth(max_width, QtCore.Qt.SmoothTransformation)
+				self.setPixmap(pm)
+				eff = QtWidgets.QGraphicsOpacityEffect(self)
+				eff.setOpacity(opacity)
+				self.setGraphicsEffect(eff)
+
+def make_card(*widgets):
+	card = QtWidgets.QFrame()
+	card.setObjectName("Card")
+	card.setProperty("class", "Card")
+	layout = QtWidgets.QVBoxLayout(card)
+	layout.setContentsMargins(12, 12, 12, 12)
+	layout.setSpacing(8)
+	for w in widgets:
+		layout.addWidget(w)
+	return card
+      
+def qimage_to_bgr_np(qimg: QtGui.QImage) -> np.ndarray:
+	fmt = qimg.format()
+	qimg = qimg.convertToFormat(QtGui.QImage.Format_RGBA8888)  # unify
+	w, h = qimg.width(), qimg.height()
+	ptr = qimg.bits()
+	ptr.setsize(qimg.byteCount())
+	arr = np.frombuffer(ptr, np.uint8).reshape(h, w, 4)  # RGBA
+	bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+	return bgr
+
+def bgr_np_to_qimage(bgr: np.ndarray) -> QtGui.QImage:
+	h, w = bgr.shape[:2]
+	# QT has a native BGR888 format; avoid extra channel copy
+	qimg = QtGui.QImage(bgr.data, w, h, bgr.strides[0], QtGui.QImage.Format_BGR888)
+
+	return qimg.copy()

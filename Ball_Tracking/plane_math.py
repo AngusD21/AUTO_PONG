@@ -452,9 +452,14 @@ def roi_box_edges_px_from_overlay_clipped(
 	return segs
 
 
-def overlay_plane_and_roi_on_bgr_po(bgr, intr, po, y_min, y_max, 
-								x_extend, z_extend, mirror_x, mirror_z, 
-								show_plane, show_roi):
+def overlay_plane_and_roi_on_bgr_po(bgr, intr, po, roi_dict, show_plane, show_roi):
+	
+	y_min    = roi_dict["roi_y_min"]
+	y_max    = roi_dict["roi_y_max"]
+	x_extend = roi_dict["roi_x_extend"]
+	z_extend = roi_dict["roi_z_extend"]
+	mirror_x = roi_dict["roi_mirror_x"]
+	mirror_z = roi_dict["roi_mirror_z"]
 	
 	return overlay_plane_and_roi_on_bgr(bgr, intr, po["p0"], po["u"], po["v"], po["normal"], po["width_m"], po["length_m"], y_min, y_max, 
 								x_extend, z_extend, mirror_x, mirror_z, 
@@ -502,3 +507,123 @@ def overlay_plane_and_roi_on_bgr(bgr, intr, p0, u, v, n, width_m, length_m, y_mi
 			cv2.line(out, (int(x0), int(y0)), (int(x1), int(y1)),
 					bgr_color, edge_thickness, cv2.LINE_AA)
 	return out
+
+def _render_interest_region_from_cloud(depth_u16, intr, xyz_full, po, depth_scale, roi_dict):
+
+	# Basic guards
+	if depth_u16 is None or intr is None or xyz_full is None or xyz_full.size == 0:
+		return colourise_depth(depth_u16, depth_scale)
+
+	if roi_dict:
+		roi_y_min    = roi_dict["roi_y_min"]
+		roi_y_max    = roi_dict["roi_y_max"]
+		roi_x_extend = roi_dict["roi_x_extend"]
+		roi_z_extend = roi_dict["roi_z_extend"]
+		roi_mirror_x = roi_dict["roi_mirror_x"]
+		roi_mirror_z = roi_dict["roi_mirror_z"]
+	else:
+		print("No ROI")
+		return colourise_depth(depth_u16, depth_scale)
+	
+	# Background image
+	# fast greyscale from depth (mm), then to BGR
+	depth_mm = depth_u16.astype(np.float32) * (depth_scale * 1000.0)
+	valid = depth_u16 > 0
+	if valid.any():
+		lo = float(np.percentile(depth_mm[valid], 2))
+		hi = float(np.percentile(depth_mm[valid], 98))
+		if hi <= lo:
+			lo, hi = 400.0, 3000.0
+	else:
+		lo, hi = 400.0, 3000.0
+	norm = np.zeros_like(depth_mm, np.float32)
+	if valid.any():
+		norm[valid] = np.clip((depth_mm[valid] - lo) / (hi - lo + 1e-6), 0, 1)
+	grey_u8 = (norm * 255.0).astype(np.uint8)
+	out = cv2.cvtColor(grey_u8, cv2.COLOR_GRAY2BGR)
+	out[~valid] = (0, 0, 0)
+
+	h, w = out.shape[:2]
+
+	# Plane/ROI params
+	if not po:
+		return out
+	p0 = np.asarray(po["p0"], float)
+	u  = np.asarray(po["u"],  float)
+	v  = np.asarray(po["v"],  float)
+	n  = np.asarray(po["normal"], float)
+
+	width_m  = float(po.get("width_m",  0.7))
+	length_m = float(po.get("length_m", 0.7))
+
+	# --- World-space ROI mask over full cloud ---
+	inside_full = roi_mask_points_world(
+		xyz_full, p0, u, v, n,
+		width_m, length_m,
+		roi_y_min, roi_y_max,
+		roi_x_extend, roi_z_extend,
+		roi_mirror_x, roi_mirror_z
+	)
+	if not inside_full.any():
+		return out
+
+	pts_in = xyz_full[inside_full]
+
+	# --- Project those ROI points to depth pixels (skip behind camera) ---
+	px, valid = project_points_px_masked(pts_in, intr)
+	px = px[valid]
+	if px.size == 0:
+		return out
+
+	# Build/clean a pixel mask
+	xs = np.clip(px[:, 0], 0, w - 1)
+	ys = np.clip(px[:, 1], 0, h - 1)
+	mask = np.zeros((h, w), np.uint8)
+	mask[ys, xs] = 255
+	k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+	mask = cv2.dilate(mask, k, iterations=1)
+	mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+
+	# --- Green overlay (alpha blend) ---
+	overlay = out.copy()
+	overlay[mask > 0] = (0, 255, 0)
+	out = cv2.addWeighted(overlay, 0.35, out, 0.65, 0.0)
+
+	return out
+
+
+def colourise_depth(depth_u16, depth_scale, clip_mm=(400, 3000), use_auto_percentiles=False):
+
+	# Convert to millimetres
+	depth_mm = depth_u16.astype(np.float32) * (depth_scale * 1000.0)
+	valid = depth_u16 > 0
+
+	# Choose visualization range
+	if use_auto_percentiles:
+		if valid.any():
+			lo = float(np.percentile(depth_mm[valid], 2))
+			hi = float(np.percentile(depth_mm[valid], 98))
+			if hi <= lo:   # fallback if scene is flat
+				lo, hi = 400.0, 3000.0
+		else:
+			lo, hi = 400.0, 3000.0
+	else:
+		lo, hi = clip_mm
+
+	# Clamp to [lo,hi] only on valid pixels
+	vis = np.zeros_like(depth_mm, dtype=np.float32)
+	if valid.any():
+		vis[valid] = np.clip(depth_mm[valid], lo, hi)
+
+	vis_u8 = np.zeros_like(depth_u16, dtype=np.uint8)
+	rng = (hi - lo)
+	if rng > 1e-6 and valid.any():
+		vis_u8[valid] = np.round(255.0 * (vis[valid] - lo) / rng).astype(np.uint8)
+
+	vis_bgr = cv2.applyColorMap(vis_u8, cv2.COLORMAP_JET)
+
+	# Make invalid pixels black (optional but helpful)
+	if valid.any():
+		vis_bgr[~valid] = (0, 0, 0)
+
+	return vis_bgr

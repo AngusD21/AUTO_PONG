@@ -1,18 +1,12 @@
-import sys, os, time, json, math, threading
+import sys, os, time, json, math, cv2, serial
 from dataclasses import dataclass
 from collections import deque
 import numpy as np
-import cv2
-import serial
-
 from PyQt5 import QtCore, QtGui, QtWidgets
-from pyqtgraph.exporters import ImageExporter
-import pyrealsense2 as rs
-
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
-from Ball_Tracking.graphics_objects import  AspectImageView, CollapsibleCard, RangeSlider, AxisGlyph, AXIS_COLORS
+from Ball_Tracking.graphics_objects import  AspectImageView, CollapsibleCard, RangeSlider, AxisGlyph, bgr_np_to_qimage, qimage_to_bgr_np
 from Ball_Tracking.graphics_objects import  _backing_spin, _colored_span, _link_half_to_span, _link_span_to_half,make_full_slider_row, _span_box
 from Ball_Tracking.plane_math import TablePlane, _R_from_n_and_u, _R_yxz, _RzRyRx, _box_mask, _euler_from_R_yxz, _fit_plane_svd, _project_uvn, overlay_plane_and_roi_on_bgr
 from Ball_Tracking.plane_math import _plane_R_from_base_and_loc, _plane_corners_world, _plane_p0_from_base_and_loc, _corners_world, _roi_corners_world
@@ -59,7 +53,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		root.setContentsMargins(8,8,8,8)
 		root.setSpacing(8)
 
-		# ---------- 3D Tab ----------
+		# 3D Tab
 		if 1:
 			self.leftTabs = QtWidgets.QTabWidget()
 			self.leftTabs.setTabPosition(QtWidgets.QTabWidget.North)
@@ -139,9 +133,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			tabCam = QtWidgets.QWidget()
 			tcam_v = QtWidgets.QVBoxLayout(tabCam); tcam_v.setContentsMargins(0,0,0,0)
 			self.camLabel = AspectImageView(self)
-			# self.camLabel.setAlignment(QtCore.Qt.AlignCenter)
-			# self.camLabel.setMinimumHeight(200)
-			# self.camLabel.setStyleSheet("background:#111; color:#888;")
 			tcam_v.addWidget(self.camLabel, 1)
 			self.leftTabs.addTab(tabCam, "Camera")
 
@@ -209,7 +200,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self.plot_uv.addItem(self.uv_plane_poly)
 			self.plot_un.addItem(self.un_plane_poly)
 			self.plot_vn.addItem(self.vn_plane_poly)
-
 
 		# ---------- Right panel ----------
 		if 1:
@@ -684,7 +674,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 					colors[inside_vis] = (1.0, 1.0, 1.0, 0.8)
 
 				self.cloud_item.setData(pos=xyz_vis, color=colors)
-
 
 		# Tab 1: Camera
 		elif idx == 1:
@@ -1653,21 +1642,3 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		self.camLabel.setImage(bgr_np_to_qimage(show))
 #=================================================================
 
-def qimage_to_bgr_np(qimg: QtGui.QImage) -> np.ndarray:
-	"""Convert QImage (RGB888/RGBA8888/BGR888) -> BGR uint8 ndarray."""
-	fmt = qimg.format()
-	qimg = qimg.convertToFormat(QtGui.QImage.Format_RGBA8888)  # unify
-	w, h = qimg.width(), qimg.height()
-	ptr = qimg.bits()
-	ptr.setsize(qimg.byteCount())
-	arr = np.frombuffer(ptr, np.uint8).reshape(h, w, 4)  # RGBA
-	bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-	return bgr
-
-def bgr_np_to_qimage(bgr: np.ndarray) -> QtGui.QImage:
-	"""Convert BGR uint8 ndarray -> QImage (BGR888)."""
-	h, w = bgr.shape[:2]
-	# QT has a native BGR888 format; avoid extra channel copy
-	qimg = QtGui.QImage(bgr.data, w, h, bgr.strides[0], QtGui.QImage.Format_BGR888)
-	# Make a deep copy so buffer lifetime isn’t tied to numpy array
-	return qimg.copy()
