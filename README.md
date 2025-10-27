@@ -1,5 +1,5 @@
 # DEADSHOT
-Thesis 2025 - Ball Tracking and Trajectory Conforming Flight Path Interception
+Thesis 2025 - Ball Tracking and Trajectory Conforming Flight Path Interception.
 Fully integrated ui suite for the Intel Realsense D435 depth camera.
 Features:
   - Live control of camera feed and detection algorithms.
