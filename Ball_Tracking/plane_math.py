@@ -223,37 +223,35 @@ def project_points_px(pts3d: np.ndarray, intr) -> np.ndarray:
 							np.rint(y).astype(np.int32)])
 
 
-
 def project_points_px_masked(pts3d: np.ndarray, intr, z_eps: float = 1e-6):
-	"""
-	Project Nx3 -> (px Nx2 int32, valid Nx bool).
-	Marks points with Z<=z_eps invalid so callers can drop edges that cross behind camera.
-	Supports RealSense intrinsics obj, dict, or 3x3 K.
-	"""
-	P = np.asarray(pts3d, float).reshape(-1, 3)
-	# parse intrinsics (same logic you already have)
-	fx = fy = cx = cy = None
-	if hasattr(intr, "fx"):
-		fx, fy = float(intr.fx), float(intr.fy)
-		cx = float(getattr(intr, "ppx", getattr(intr, "cx", 0.0)))
-		cy = float(getattr(intr, "ppy", getattr(intr, "cy", 0.0)))
-	elif isinstance(intr, dict):
-		fx, fy = float(intr.get("fx", 0.0)), float(intr.get("fy", 0.0))
-		cx = float(intr.get("ppx", intr.get("cx", 0.0)))
-		cy = float(intr.get("ppy", intr.get("cy", 0.0)))
-	else:
-		K = np.asarray(intr, float)
-		fx, fy, cx, cy = float(K[0,0]), float(K[1,1]), float(K[0,2]), float(K[1,2])
+    P = np.asarray(pts3d, float).reshape(-1, 3)
 
-	X, Y, Z = P[:,0], P[:,1], P[:,2]
-	valid = Z > z_eps
-	# avoid dividing invalid rows
-	x = np.empty_like(X); y = np.empty_like(Y)
-	x[:] = np.nan; y[:] = np.nan
-	x[valid] = X[valid] * fx / Z[valid] + cx
-	y[valid] = Y[valid] * fy / Z[valid] + cy
-	px = np.column_stack([np.rint(x), np.rint(y)]).astype(np.int32)
-	return px, valid
+    # ---- intrinsics parsing (unchanged) ----
+    if hasattr(intr, "fx"):
+        fx, fy = float(intr.fx), float(intr.fy)
+        cx = float(getattr(intr, "ppx", getattr(intr, "cx", 0.0)))
+        cy = float(getattr(intr, "ppy", getattr(intr, "cy", 0.0)))
+    elif isinstance(intr, dict):
+        fx, fy = float(intr.get("fx", 0.0)), float(intr.get("fy", 0.0))
+        cx = float(intr.get("ppx", intr.get("cx", 0.0)))
+        cy = float(intr.get("ppy", intr.get("cy", 0.0)))
+    else:
+        K = np.asarray(intr, float); fx, fy, cx, cy = float(K[0,0]), float(K[1,1]), float(K[0,2]), float(K[1,2])
+
+    X, Y, Z = P[:,0], P[:,1], P[:,2]
+    valid = Z > z_eps
+
+    x = np.empty_like(X); y = np.empty_like(Y)
+    x[:] = np.nan;        y[:] = np.nan
+    x[valid] = X[valid] * fx / Z[valid] + cx
+    y[valid] = Y[valid] * fy / Z[valid] + cy
+
+    # Build integer array without ever casting NaNs
+    px = np.zeros((P.shape[0], 2), np.int32)
+    vi = valid.nonzero()[0]
+    px[vi, 0] = np.rint(x[valid]).astype(np.int32)
+    px[vi, 1] = np.rint(y[valid]).astype(np.int32)
+    return px, valid
 
 
 def plane_corners_world_from_overlay(p0, u, v, width_m, length_m) -> np.ndarray:
@@ -312,16 +310,6 @@ def roi_corners_world_from_overlay(
 	hi = base + n[None, :]*float(y_max)
 	return np.vstack([lo, hi])
 
-def plane_poly_px_from_overlay(plane_overlay, intr) -> np.ndarray:
-	"""
-	plane_overlay keys: p0,u,v,width_m,length_m
-	returns (4,2) int32 polygon in pixel coords (c00..c01)
-	"""
-	p0 = plane_overlay["p0"]; u = plane_overlay["u"]; v = plane_overlay["v"]
-	w  = plane_overlay.get("width_m", 0.7)
-	l  = plane_overlay.get("length_m", 0.7)
-	corners = plane_corners_world_from_overlay(p0, u, v, w, l)  # (4,3)
-	return project_points_px(corners, intr)
 
 def roi_box_edges_px_from_overlay(*, p0, u, v, n, width_m, length_m, intr, y_min, y_max, x_extend, z_extend, mirror_x, mirror_z):
 
@@ -365,7 +353,7 @@ def roi_mask_points_world(pts, p0, u, v, n, width_m, length_m, y_min, y_max, x_e
 	inside = (U >= u_min) & (U <= u_max) & (V >= v_min) & (V <= v_max) & (N >= y0) & (N <= y1)
 	return inside
 
-def plane_poly_px_from_overlay(*, p0, u, v, width_m, length_m, intr):
+def plane_poly_px_from_overlay(p0, u, v, width_m, length_m, intr):
 	corners = plane_corners_world_from_overlay(p0, u, v, width_m, length_m)
 	return project_points_px(corners, intr)
 
@@ -403,63 +391,120 @@ def clip_segment_to_image(p0, p1, w, h):
 			x1, y1 = x, y; c1 = _outcode(x1,y1,w,h)
 
 def clip_poly_points_to_image(poly_xy, w, h):
-	"""Clamp points for fills (safe for cv2.fillPoly)."""
-	p = np.asarray(poly_xy, np.int32).copy()
-	p[:,0] = np.clip(p[:,0], 0, w-1)
-	p[:,1] = np.clip(p[:,1], 0, h-1)
-	return p
 
-# ================= ROI/Plane projected helpers =================
-def roi_footprint_poly_px_from_overlay(
-	*, p0, u, v, n, width_m, length_m,
-	x_extend, z_extend, mirror_x, mirror_z,
-	intr):
-	"""
-	Project the ROI's base rectangle (with mirror/extends) to pixels as a 4x2 int32 polygon.
-	"""
-	# Build extended base on the plane (bottom ring of roi_corners_world_from_overlay)
-	base8 = roi_corners_world_from_overlay(
-		p0, u, v, n, width_m, length_m,
-		y_min=0.0, y_max=0.0,  # base
-		mirror_x=mirror_x, mirror_z=mirror_z,
-		x_extend=x_extend, z_extend=z_extend
-	)
-	base4 = base8[:4]  # bottom loop
-	poly = project_points_px(base4, intr)
-	return poly.astype(np.int32)
+    def inside(p, edge):
+        x,y = p
+        if edge == 0:   return x >= 0        # left
+        if edge == 1:   return x <= w-1      # right
+        if edge == 2:   return y >= 0        # top
+        return            y <= h-1           # bottom
+
+    def intersect(p1, p2, edge):
+        x1,y1 = p1; x2,y2 = p2
+        dx, dy = x2-x1, y2-y1
+        if edge == 0:     # left x=0
+            t = (0 - x1) / (dx + 1e-12); return (0, y1 + t*dy)
+        elif edge == 1:   # right x=w-1
+            t = ((w-1) - x1) / (dx + 1e-12); return (w-1, y1 + t*dy)
+        elif edge == 2:   # top y=0
+            t = (0 - y1) / (dy + 1e-12); return (x1 + t*dx, 0)
+        else:             # bottom y=h-1
+            t = ((h-1) - y1) / (dy + 1e-12); return (x1 + t*dx, h-1)
+
+    if poly_xy is None or len(poly_xy) == 0:
+        return np.zeros((0,2), np.int32)
+
+    output = np.asarray(poly_xy, dtype=np.float32)
+    # clip against 4 edges: 0=left,1=right,2=top,3=bottom
+    for edge in range(4):
+        if len(output) == 0:
+            break
+        input_list = output
+        output = []
+        S = input_list[-1]
+        for E in input_list:
+            if inside(E, edge):
+                if inside(S, edge):
+                    output.append(E)
+                else:
+                    output.append(intersect(S, E, edge))
+                    output.append(E)
+            else:
+                if inside(S, edge):
+                    output.append(intersect(S, E, edge))
+            S = E
+        output = np.asarray(output, dtype=np.float32)
+
+    return np.rint(output).astype(np.int32)
 
 
 def roi_box_edges_px_from_overlay_clipped(
-	*, p0, u, v, n, width_m, length_m, intr,
-	y_min, y_max, x_extend, z_extend, mirror_x, mirror_z,
-	image_shape
+    *, p0, u, v, n, width_m, length_m, intr,
+    y_min, y_max, x_extend, z_extend, mirror_x, mirror_z,
+    image_shape, z_eps=1e-6
 ):
-	# build 8 corners (bottom[0..3], top[4..7]) using your existing function
-	roi8 = roi_corners_world_from_overlay(
-		p0, u, v, n, width_m, length_m,
-		y_min, y_max, mirror_x, mirror_z, x_extend, z_extend
-	)
-	px8, valid = project_points_px_masked(roi8, intr)  # << use masked projector
-	h, w = image_shape[:2]
-	edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
-	segs = []
-	for i, j in edges:
-		if not (valid[i] and valid[j]):
-			continue  # drop segments with an endpoint behind the camera
-		seg = clip_segment_to_image(px8[i], px8[j], w, h)
-		if seg is not None:
-			segs.append(seg)
-	return segs
+    # Build 8 corners (camera-frame 3D)
+    roi8 = roi_corners_world_from_overlay(
+        p0, u, v, n, width_m, length_m,
+        y_min, y_max, mirror_x, mirror_z, x_extend, z_extend
+    )
 
+    h, w = image_shape[:2]
+    edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
+    segs = []
+
+    for i, j in edges:
+        Pi, Pj = roi8[i], roi8[j]
+
+        # Clip 3D to near plane first
+        Qi, Qj, ok = clip_segment_to_near_plane(np.asarray(Pi,float), np.asarray(Pj,float), z_eps=z_eps)
+        if not ok:
+            continue
+
+        # Project endpoints (now guaranteed Z >= z_eps)
+        px_2d, valid = project_points_px_masked(np.stack([Qi, Qj], axis=0), intr, z_eps=z_eps)
+        # both must be valid after near-plane clip
+        if not (valid[0] and valid[1]):
+            continue
+
+        # Image-rect clip in pixel space
+        q = clip_segment_to_image(px_2d[0], px_2d[1], w, h)
+        if q is not None:
+            segs.append(q)
+
+    return segs
+
+def clip_segment_to_near_plane(Pi, Pj, z_eps=1e-6):
+    """
+    Clip 3D segment Pi->Pj to Z >= z_eps (camera forward).
+    Returns (Qi, Qj, ok). ok=False if the whole segment is behind.
+    """
+    Zi, Zj = Pi[2], Pj[2]
+    inside_i = Zi >= z_eps
+    inside_j = Zj >= z_eps
+
+    if inside_i and inside_j:
+        return Pi, Pj, True
+    if (not inside_i) and (not inside_j):
+        return None, None, False
+
+    # exactly one is outside -> intersect with Z=z_eps
+    t = (z_eps - Zi) / (Zj - Zi + 1e-12)
+    Pk = Pi + t * (Pj - Pi)
+
+    if inside_i:
+        return Pi, Pk, True
+    else:
+        return Pk, Pj, True
 
 def overlay_plane_and_roi_on_bgr_po(bgr, intr, po, roi_dict, show_plane, show_roi):
 	
-	y_min    = roi_dict["roi_y_min"]
-	y_max    = roi_dict["roi_y_max"]
-	x_extend = roi_dict["roi_x_extend"]
-	z_extend = roi_dict["roi_z_extend"]
-	mirror_x = roi_dict["roi_mirror_x"]
-	mirror_z = roi_dict["roi_mirror_z"]
+	y_min    = roi_dict["y_min"]
+	y_max    = roi_dict["y_max"]
+	x_extend = roi_dict["x_extend"]
+	z_extend = roi_dict["z_extend"]
+	mirror_x = roi_dict["mirror_x"]
+	mirror_z = roi_dict["mirror_z"]
 	
 	return overlay_plane_and_roi_on_bgr(bgr, intr, po["p0"], po["u"], po["v"], po["normal"], po["width_m"], po["length_m"], y_min, y_max, 
 								x_extend, z_extend, mirror_x, mirror_z, 
@@ -480,12 +525,13 @@ def overlay_plane_and_roi_on_bgr(bgr, intr, p0, u, v, n, width_m, length_m, y_mi
 		poly_px = clip_poly_points_to_image(poly_px, w, h)
 
 		# fill (alpha) + outline
-		overlay = out.copy()
-		cv2.fillPoly(overlay, [poly_px], color=(plane_edge_color[2], plane_edge_color[1], plane_edge_color[0]))
-		cv2.addWeighted(overlay, plane_fill_alpha, out, 1.0 - plane_fill_alpha, 0, out)
-		cv2.polylines(out, [poly_px], isClosed=True,
-		              color=(plane_edge_color[2], plane_edge_color[1], plane_edge_color[0]),
-		              thickness=edge_thickness, lineType=cv2.LINE_AA)
+		if len(poly_px) >= 3:
+			overlay = out.copy()
+			cv2.fillPoly(overlay, [poly_px], color=(plane_edge_color[2], plane_edge_color[1], plane_edge_color[0]))
+			cv2.addWeighted(overlay, plane_fill_alpha, out, 1.0 - plane_fill_alpha, 0, out)
+			cv2.polylines(out, [poly_px], isClosed=True,
+						color=(plane_edge_color[2], plane_edge_color[1], plane_edge_color[0]),
+						thickness=edge_thickness, lineType=cv2.LINE_AA)
 
 	if show_roi:
 		segs = roi_box_edges_px_from_overlay_clipped(
@@ -515,14 +561,13 @@ def _render_interest_region_from_cloud(depth_u16, intr, xyz_full, po, depth_scal
 		return colourise_depth(depth_u16, depth_scale)
 
 	if roi_dict:
-		roi_y_min    = roi_dict["roi_y_min"]
-		roi_y_max    = roi_dict["roi_y_max"]
-		roi_x_extend = roi_dict["roi_x_extend"]
-		roi_z_extend = roi_dict["roi_z_extend"]
-		roi_mirror_x = roi_dict["roi_mirror_x"]
-		roi_mirror_z = roi_dict["roi_mirror_z"]
+		roi_y_min    = roi_dict["y_min"]
+		roi_y_max    = roi_dict["y_max"]
+		roi_x_extend = roi_dict["x_extend"]
+		roi_z_extend = roi_dict["z_extend"]
+		roi_mirror_x = roi_dict["mirror_x"]
+		roi_mirror_z = roi_dict["mirror_z"]
 	else:
-		print("No ROI")
 		return colourise_depth(depth_u16, depth_scale)
 	
 	# Background image
@@ -552,6 +597,7 @@ def _render_interest_region_from_cloud(depth_u16, intr, xyz_full, po, depth_scal
 	u  = np.asarray(po["u"],  float)
 	v  = np.asarray(po["v"],  float)
 	n  = np.asarray(po["normal"], float)
+	# if po["flip_n"]: n = -n
 
 	width_m  = float(po.get("width_m",  0.7))
 	length_m = float(po.get("length_m", 0.7))

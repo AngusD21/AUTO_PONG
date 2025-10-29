@@ -6,7 +6,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
-from Ball_Tracking.graphics_objects import  AspectImageView, CollapsibleCard, RangeSlider, AxisGlyph, bgr_np_to_qimage, qimage_to_bgr_np
+from Ball_Tracking.graphics_objects import  AspectImageView, BackgroundLogo, CollapsibleCard, RangeSlider, AxisGlyph, _apply_overlays, _apply_rotation, bgr_np_to_qimage, qimage_to_bgr_np
 from Ball_Tracking.graphics_objects import  _backing_spin, _colored_span, _link_half_to_span, _link_span_to_half,make_full_slider_row, _span_box
 from Ball_Tracking.plane_math import TablePlane, _R_from_n_and_u, _R_yxz, _RzRyRx, _box_mask, _euler_from_R_yxz, _fit_plane_svd, _project_uvn, overlay_plane_and_roi_on_bgr
 from Ball_Tracking.plane_math import _plane_R_from_base_and_loc, _plane_corners_world, _plane_p0_from_base_and_loc, _corners_world, _roi_corners_world
@@ -46,7 +46,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		
 		self.flip_u = False
 		self.flip_v = False
-		self.flip_n = False
+		self.flip_n = True
 
 		# Layout: GL on the left, controls on the right
 		root = QtWidgets.QHBoxLayout(self)
@@ -137,8 +137,6 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self.leftTabs.addTab(tabCam, "Camera")
 
 			self.cam_running = True
-			self.cam_show_plane = False
-			self.cam_show_roi   = False
 			self._last_cam_ts   = 0.0
 			self._cam_interval  = 1.0 / 30.0
 
@@ -296,8 +294,14 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			rc.addWidget(self.btnCamStart); rc.addWidget(self.btnCamStop); rc.addWidget(self.btnCamSnap)
 			self.contextStack.addWidget(rowCam)
 
-			self.chkCamPlane.toggled.connect(lambda v: setattr(self, "cam_show_plane", bool(v)))
-			self.chkCamROI.toggled.connect(lambda v: setattr(self, "cam_show_roi",   bool(v)))
+			self.chkCamPlane.setChecked(self.worker.draw_plane)
+			self.chkCamROI.setChecked(self.worker.draw_roi)
+			self.chkCamPlane.toggled[bool].connect(
+				lambda v: setattr(self.worker, "draw_plane", bool(v)) if getattr(self, "worker", None) else None
+			)
+			self.chkCamROI.toggled[bool].connect(
+				lambda v: setattr(self.worker, "draw_roi", bool(v)) if getattr(self, "worker", None) else None
+			)
 
 			self.btnCamStart.clicked.connect(lambda: setattr(self, "cam_running", True))
 			self.btnCamStop.clicked.connect(lambda: setattr(self, "cam_running", False))
@@ -319,6 +323,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		right.setContentsMargins(0,0,0,0)
 		right.setSpacing(12)
 		scroll.setWidget(right_host)
+
 
 		# ---------- BOX CARD ----------
 		if 1:
@@ -360,26 +365,26 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			_link_span_to_half(span_z, self.ez); _link_half_to_span(self.ez, span_z)
 
 			# Sliders: Center (m)
-			self.row_cx, self.s_cx, self.sp_cx, i2v_cx, v2i_cx, _ = make_full_slider_row("Center X", -10.0, 10.0, 0.005, self.cx.value(), "x", " m")
-			self.row_cy, self.s_cy, self.sp_cy, i2v_cy, v2i_cy, _ = make_full_slider_row("Center Y", -10.0, 10.0, 0.005, self.cy.value(), "y", " m")
-			self.row_cz, self.s_cz, self.sp_cz, i2v_cz, v2i_cz, _ = make_full_slider_row("Center Z", -10.0, 10.0, 0.005, self.cz.value(), "z", " m")
-
-			self.s_cx.valueChanged.connect(lambda i: (self.cx.setValue(i2v_cx(i)), self._update_box()))
-			self.s_cy.valueChanged.connect(lambda i: (self.cy.setValue(i2v_cy(i)), self._update_box()))
-			self.s_cz.valueChanged.connect(lambda i: (self.cz.setValue(i2v_cz(i)), self._update_box()))
-			self.sp_cx.valueChanged.connect(lambda v: (self.cx.setValue(v), self._update_box()))
-			self.sp_cy.valueChanged.connect(lambda v: (self.cy.setValue(v), self._update_box()))
-			self.sp_cz.valueChanged.connect(lambda v: (self.cz.setValue(v), self._update_box()))
-			self.cx.valueChanged.connect(lambda v: (self.s_cx.blockSignals(True), self.s_cx.setValue(v2i_cx(v)), self.s_cx.blockSignals(False), self.sp_cx.blockSignals(True), self.sp_cx.setValue(v), self.sp_cx.blockSignals(False)))
-			self.cy.valueChanged.connect(lambda v: (self.s_cy.blockSignals(True), self.s_cy.setValue(v2i_cy(v)), self.s_cy.blockSignals(False), self.sp_cy.blockSignals(True), self.sp_cy.setValue(v), self.sp_cy.blockSignals(False)))
-			self.cz.valueChanged.connect(lambda v: (self.s_cz.blockSignals(True), self.s_cz.setValue(v2i_cz(v)), self.s_cz.blockSignals(False), self.sp_cz.blockSignals(True), self.sp_cz.setValue(v), self.sp_cz.blockSignals(False)))
-
-			box_layout.addWidget(self.row_cx); box_layout.addWidget(self.row_cy); box_layout.addWidget(self.row_cz)
+			self.row_cx, self.s_cx, self.sp_cx, i2v_cx, v2i_cx, _ = make_full_slider_row("Center X", -2.0, 2.0, 0.001, self.cx.value(), "x", " m")
+			self.row_cy, self.s_cy, self.sp_cy, i2v_cy, v2i_cy, _ = make_full_slider_row("Center Y", -2.0, 2.0, 0.001, self.cy.value(), "y", " m")
+			self.row_cz, self.s_cz, self.sp_cz, i2v_cz, v2i_cz, _ = make_full_slider_row("Center Z", -2.0, 2.0, 0.001, self.cz.value(), "z", " m")
 
 			# Sliders: Rotation (deg)
-			self.row_yw, self.s_yw, self.sp_yw, i2v_yw, v2i_yw, _ = make_full_slider_row("Yaw",   -180.0, 180.0, 0.1, self.yaw.value(),   "y", "°")
-			self.row_pt, self.s_pt, self.sp_pt, i2v_pt, v2i_pt, _ = make_full_slider_row("Pitch", -90.0, 90.0, 0.1, self.pitch.value(), "x", "°")
-			self.row_rl, self.s_rl, self.sp_rl, i2v_rl, v2i_rl, _ = make_full_slider_row("Roll",  -90.0, 90.0, 0.1, self.roll.value(),  "z", "°")
+			self.row_yw, self.s_yw, self.sp_yw, i2v_yw, v2i_yw, _ = make_full_slider_row("Yaw",   -180.0, 180.0, 0.01, self.yaw.value(),   "y", "°")
+			self.row_pt, self.s_pt, self.sp_pt, i2v_pt, v2i_pt, _ = make_full_slider_row("Pitch", -90.0, 90.0, 0.01, self.pitch.value(), "x", "°")
+			self.row_rl, self.s_rl, self.sp_rl, i2v_rl, v2i_rl, _ = make_full_slider_row("Roll",  -90.0, 90.0, 0.01, self.roll.value(),  "z", "°")
+
+			# Box center
+			self._bind_row(self.cx, self.s_cx, self.sp_cx, i2v_cx, v2i_cx, lambda _: self._update_box())
+			self._bind_row(self.cy, self.s_cy, self.sp_cy, i2v_cy, v2i_cy, lambda _: self._update_box())
+			self._bind_row(self.cz, self.s_cz, self.sp_cz, i2v_cz, v2i_cz, lambda _: self._update_box())
+
+			# Box rotation (global)
+			self._bind_row(self.yaw,   self.s_yw, self.sp_yw, i2v_yw, v2i_yw, lambda v: self._update_box())
+			self._bind_row(self.pitch, self.s_pt, self.sp_pt, i2v_pt, v2i_pt, lambda v: self._update_box())
+			self._bind_row(self.roll,  self.s_rl, self.sp_rl, i2v_rl, v2i_rl, lambda v: self._update_box())
+
+			box_layout.addWidget(self.row_cx); box_layout.addWidget(self.row_cy); box_layout.addWidget(self.row_cz)
 
 			self.s_yw.valueChanged.connect(lambda i: (self.yaw.setValue(i2v_yw(i)), self._update_box()))
 			self.s_pt.valueChanged.connect(lambda i: (self.pitch.setValue(i2v_pt(i)), self._update_box()))
@@ -423,15 +428,15 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			pln_layout.addWidget(row_psp)
 
 			# Local position (store sliders & mappers)
-			row_lx, self.s_lx, self.sp_lx, self.i2v_lx, self.v2i_lx, _ = make_full_slider_row("Local X", -2.0, 2.0, 0.002, 0.0, "x", " m")
-			row_ly, self.s_ly, self.sp_ly, self.i2v_ly, self.v2i_ly, _ = make_full_slider_row("Local Y", -2.0, 2.0, 0.002, 0.0, "y", " m")
-			row_lz, self.s_lz, self.sp_lz, self.i2v_lz, self.v2i_lz, _ = make_full_slider_row("Local Z", -2.0, 2.0, 0.002, 0.0, "z", " m")
+			row_lx, self.s_lx, self.sp_lx, self.i2v_lx, self.v2i_lx, _ = make_full_slider_row("Local X", -2.0, 2.0, 0.001, 0.0, "x", " m")
+			row_ly, self.s_ly, self.sp_ly, self.i2v_ly, self.v2i_ly, _ = make_full_slider_row("Local Y", -2.0, 2.0, 0.001, 0.0, "y", " m")
+			row_lz, self.s_lz, self.sp_lz, self.i2v_lz, self.v2i_lz, _ = make_full_slider_row("Local Z", -2.0, 2.0, 0.001, 0.0, "z", " m")
 			pln_layout.addWidget(row_lx); pln_layout.addWidget(row_ly); pln_layout.addWidget(row_lz)
 
 			# Local rotations (store sliders & mappers)
-			row_yw2, self.s_yw2, self.sp_yw2, self.i2v_yw2, self.v2i_yw2, _ = make_full_slider_row("Yaw (about n)",   -180.0, 180.0, 0.1, 0.0, "y", "°")
-			row_pt2, self.s_pt2, self.sp_pt2, self.i2v_pt2, self.v2i_pt2, _ = make_full_slider_row("Pitch (about u)",  -89.0,   89.0, 0.1, 0.0, "x", "°")
-			row_rl2, self.s_rl2, self.sp_rl2, self.i2v_rl2, self.v2i_rl2, _ = make_full_slider_row("Roll (about v)",   -89.0,   89.0, 0.1, 0.0, "z", "°")
+			row_yw2, self.s_yw2, self.sp_yw2, self.i2v_yw2, self.v2i_yw2, _ = make_full_slider_row("Yaw (about n)",   -45.0, 45.0, 0.01, 0.0, "y", "°")
+			row_pt2, self.s_pt2, self.sp_pt2, self.i2v_pt2, self.v2i_pt2, _ = make_full_slider_row("Pitch (about u)",  -89.0,   89.0, 0.01, 0.0, "x", "°")
+			row_rl2, self.s_rl2, self.sp_rl2, self.i2v_rl2, self.v2i_rl2, _ = make_full_slider_row("Roll (about v)",   -89.0,   89.0, 0.01, 0.0, "z", "°")
 			pln_layout.addWidget(row_yw2); pln_layout.addWidget(row_pt2); pln_layout.addWidget(row_rl2)
 
 			card_pln._content.setVisible(False)
@@ -444,37 +449,27 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self.chk_plane_visible.toggled.connect(lambda v: (setattr(self, "pl_visible", bool(v)), self._update_plane_draw()))
 
 			# Local position offsets
-			self.s_lx.valueChanged.connect(lambda i: (
-				self.sp_lx.blockSignals(True), self.sp_lx.setValue(self.i2v_lx(i)), self.sp_lx.blockSignals(False),
-				setattr(self, "_pl_off_local", np.array([self.i2v_lx(i), self._pl_off_local[1], self._pl_off_local[2]])),
-				self._update_plane_from_ui()
-			))
-			self.s_ly.valueChanged.connect(lambda i: (
-				self.sp_ly.blockSignals(True), self.sp_ly.setValue(self.i2v_ly(i)), self.sp_ly.blockSignals(False),
-				setattr(self, "_pl_off_local", np.array([self._pl_off_local[0], self.i2v_ly(i), self._pl_off_local[2]])),
-				self._update_plane_from_ui()
-			))
-			self.s_lz.valueChanged.connect(lambda i: (
-				self.sp_lz.blockSignals(True), self.sp_lz.setValue(self.i2v_lz(i)), self.sp_lz.blockSignals(False),
-				setattr(self, "_pl_off_local", np.array([self._pl_off_local[0], self._pl_off_local[1], self.i2v_lz(i)])),
-				self._update_plane_from_ui()
-			))
+			self._bind_row(self.sp_lx, self.s_lx, self.sp_lx, self.i2v_lx, self.v2i_lx,
+						lambda v: (setattr(self, "_pl_off_local", np.array([v, self._pl_off_local[1], self._pl_off_local[2]])), self._update_plane_from_ui()))
+			self._bind_row(self.sp_ly, self.s_ly, self.sp_ly, self.i2v_ly, self.v2i_ly,
+						lambda v: (setattr(self, "_pl_off_local", np.array([self._pl_off_local[0], v, self._pl_off_local[2]])), self._update_plane_from_ui()))
+			self._bind_row(self.sp_lz, self.s_lz, self.sp_lz, self.i2v_lz, self.v2i_lz,
+						lambda v: (setattr(self, "_pl_off_local", np.array([self._pl_off_local[0], self._pl_off_local[1], v])), self._update_plane_from_ui()))
 
-			# Local rotations (sliders drive state)
-			self.s_yw2.valueChanged.connect(lambda i: (
-				self.sp_yw2.blockSignals(True), self.sp_yw2.setValue(self.i2v_yw2(i)), self.sp_yw2.blockSignals(False),
-				setattr(self, "_pl_yaw", self.i2v_yw2(i)), self._update_plane_from_ui()
-			))
-			self.s_pt2.valueChanged.connect(lambda i: (
-				self.sp_pt2.blockSignals(True), self.sp_pt2.setValue(self.i2v_pt2(i)), self.sp_pt2.blockSignals(False),
-				setattr(self, "_pl_pitch", self.i2v_pt2(i)), self._update_plane_from_ui()
-			))
-			self.s_rl2.valueChanged.connect(lambda i: (
-				self.sp_rl2.blockSignals(True), self.sp_rl2.setValue(self.i2v_rl2(i)), self.sp_rl2.blockSignals(False),
-				setattr(self, "_pl_roll", self.i2v_rl2(i)), self._update_plane_from_ui()
-			))
+			self._bind_row(self.sp_yw2, self.s_yw2, self.sp_yw2, self.i2v_yw2, self.v2i_yw2,
+						lambda v: (setattr(self, "_pl_yaw", float(v)),   self._update_plane_from_ui()))
+			self._bind_row(self.sp_pt2, self.s_pt2, self.sp_pt2, self.i2v_pt2, self.v2i_pt2,
+						lambda v: (setattr(self, "_pl_pitch", float(v)), self._update_plane_from_ui()))
+			self._bind_row(self.sp_rl2, self.s_rl2, self.sp_rl2, self.i2v_rl2, self.v2i_rl2,
+						lambda v: (setattr(self, "_pl_roll", float(v)),  self._update_plane_from_ui()))
 
 			self.btn_fit_plane.clicked.connect(self._fit_table_plane)
+
+			for sp in (self.sp_cx, self.sp_cy, self.sp_cz,
+					self.sp_yw, self.sp_pt, self.sp_rl,
+					self.sp_lx, self.sp_ly, self.sp_lz,
+					self.sp_yw2, self.sp_pt2, self.sp_rl2):
+				sp.setSingleStep(0.01)
 
 		# ---------- SEARCH AREA CARD --------
 		if 1:
@@ -596,6 +591,27 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self.sp_roi_ymin.valueChanged.connect(lambda _: _apply_roi_from_ui())
 			self.sp_roi_ymax.valueChanged.connect(lambda _: _apply_roi_from_ui())
 
+		# # Put a faint background logo behind everything; expanding events covers it
+		# if os.path.exists(WIZARD_W):
+		# 	self._bg_logo = BackgroundLogo(WIZARD_W, opacity=0.08, parent=panel)
+
+		# 	def _place_bg_logo_once():
+		# 		# scale to match the visible right-panel width (with a small margin)
+		# 		margin = 50
+		# 		target_w = max(80, panel.width() - 2*margin)  # avoid zero/silly values
+		# 		self._bg_logo.set_scaled_width(target_w)
+
+		# 		# bottom-center placement (fixed; no future resizing)
+		# 		pw, ph = panel.width(), panel.height()
+		# 		lw, lh = self._bg_logo.width(), self._bg_logo.height()
+		# 		x = (pw - lw) // 2
+		# 		y = ph//2 - lh + 140
+		# 		self._bg_logo.move(x, y)
+		# 		self._bg_logo.lower()
+		# 		self._bg_logo.show()
+
+		# 	QtCore.QTimer.singleShot(0, _place_bg_logo_once)
+
 		# ---------- BOTTOM BUTTONS ----------
 		if 1:
 			btn_row = QtWidgets.QHBoxLayout()
@@ -641,21 +657,21 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 
 			if xyz_vis is not None and xyz_vis.shape[0] > 0:
 				# 1) full-cloud masks (length N)
-				inside_full = _box_mask( xyz,
-					self.cx.value(), self.cy.value(), self.cz.value(),
-					self.ex.value(), self.ey.value(), self.ez.value(),
-					self.yaw.value(), self.pitch.value(), self.roll.value())
-				roi_full = inside_full if getattr(self, "roi_visible", True) else np.zeros(xyz.shape[0], bool)
-
-				sel_vis = np.flatnonzero(m8)             
-				decim = getattr(self, "_vis_decim", None)
+				sel_vis = np.flatnonzero(m8)
+				decim = getattr(self, "_vis_decim", 4)
 				if decim not in (None, 1):
 					sel_vis = sel_vis[::decim]
 
 				xyz_vis = xyz[sel_vis]
 
-				inside_vis = inside_full[sel_vis]
-				roi_vis    = roi_full[sel_vis]
+				# compute mask only on decimated set
+				inside_vis = _box_mask(
+					xyz_vis,
+					self.cx.value(), self.cy.value(), self.cz.value(),
+					self.ex.value(), self.ey.value(), self.ez.value(),
+					self.yaw.value(), self.pitch.value(), self.roll.value()
+				)
+				roi_vis = inside_vis if getattr(self, "roi_visible", True) else np.zeros(xyz_vis.shape[0], bool)
 
 				colors = np.full((xyz_vis.shape[0], 4), (1, 1, 1, 0.60), dtype=float)
 
@@ -892,6 +908,10 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		self.chk_roi_mz.setChecked(self.roi_mirror_z)
 		self.sp_roi_ymin.setValue(self.roi_y_min)
 		self.sp_roi_ymax.setValue(self.roi_y_max)
+		self.rs_y.blockSignals(True)
+		self.rs_y.setLowerValue(self.roi_y_min)
+		self.rs_y.setUpperValue(self.roi_y_max)
+		self.rs_y.blockSignals(False)
 
 		cp = box.get("color_points")
 		if cp is not None:
@@ -956,6 +976,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self._update_plane_draw()
 			self._update_global_axes()
 
+
 		# ---- Camera ----
 		self._set_default_view()
 
@@ -978,6 +999,9 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			self.chk_roi_visible.blockSignals(True)
 			self.chk_roi_visible.setChecked(self.roi_visible)
 			self.chk_roi_visible.blockSignals(False)
+		
+		if "flip_n" in fl:
+			self.flip_n = bool(fl["flip_n"])
 
 	def _state_to_dict(self):
 		"""Collect full UI state (box, plane, camera, flags) -> dict."""
@@ -993,6 +1017,7 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 				"plane_visible": bool(getattr(self, "pl_visible", True)),
 				"box_visible": bool(getattr(self, "box_visible", True)),
 				"roi_visible": bool(getattr(self, "roi_visible", True)),
+				"flip_n": bool(getattr(self, 'flip_n', False)),
 			},
 			"roi": {
 				"x_extend": float(getattr(self, "roi_x_extend", 0.0)),
@@ -1004,10 +1029,12 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 			}
 		}
 
+		if self.flip_n: n_out = -self.plane.n
+		else: n_out = self.plane.n
 		if self.plane is not None:
 			state["plane"] = {
 				"p0": self.plane.p0.tolist(),
-				"normal": self.plane.n.tolist(),
+				"normal": n_out.tolist(),
 				"u": self.plane.u.tolist(),
 				"v": self.plane.v.tolist(),
 				"width_m": float(self.pl_size_x),
@@ -1022,11 +1049,23 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		return state
 
 	def _save(self):
-		
 		self.saved.emit({})
 
-		# Write the full state to JSON
+		# Bake current locals into base
 		self._canonicalize_base_from_current()
+
+		# ---- Reset locals so we don't re-apply on next load ----
+		self._pl_off_local = np.zeros(3, dtype=float)
+		self._pl_yaw = self._pl_pitch = self._pl_roll = 0.0
+		# reflect zeros into the UI controls (block signals to avoid redraw loops)
+		for sp, val in ((self.sp_lx, 0.0), (self.sp_ly, 0.0), (self.sp_lz, 0.0),
+						(self.sp_yw2, 0.0), (self.sp_pt2, 0.0), (self.sp_rl2, 0.0)):
+			sp.blockSignals(True); sp.setValue(val); sp.blockSignals(False)
+		for s, v2i in ((self.s_lx, self.v2i_lx), (self.s_ly, self.v2i_ly), (self.s_lz, self.v2i_lz),
+					(self.s_yw2, self.v2i_yw2), (self.s_pt2, self.v2i_pt2), (self.s_rl2, self.v2i_rl2)):
+			s.blockSignals(True); s.setValue(v2i(0.0)); s.blockSignals(False)
+
+		# Now serialize with locals = 0
 		state = self._state_to_dict()
 		try:
 			with open(self.config_path, "w", encoding="utf-8") as f:
@@ -1623,22 +1662,44 @@ class PlaneSetupWizard(QtWidgets.QWidget):
 		if hasattr(self, "camLabel"):
 			# Cache the *content* size available to the label (layout margins already handled by layouts)
 			self._cam_target_size = self.camLabel.size()
+	
+	def _bind_row(self, backing_spin, slider, ui_spin, i2v, v2i, on_change):
+		"""Wire slider <-> ui_spin <-> backing_spin without feedback loops."""
+		_updating = {"f": False}
+
+		def set_all_from_value(v):
+			if _updating["f"]: return
+			_updating["f"] = True
+			try:
+				backing_spin.setValue(v)                # authoritative numeric
+				slider.setValue(v2i(v))                 # slider position
+				ui_spin.setValue(v)                     # visible spin
+				if on_change: on_change(v)
+			finally:
+				_updating["f"] = False
+
+		# From slider
+		slider.valueChanged.connect(lambda i: set_all_from_value(i2v(i)))
+		# From visible spin
+		ui_spin.valueChanged.connect(lambda v: set_all_from_value(v))
+		# From backing spin (programmatic changes/load)
+		backing_spin.valueChanged.connect(lambda v: set_all_from_value(v))
+
+		# Initialize visual controls to current backing value
+		set_all_from_value(backing_spin.value())
 
 	@QtCore.pyqtSlot(QtGui.QImage)
-	def _on_rgb_for_wizard(self, qimg):
-		if qimg is None:
-			return
+	def _on_rgb_for_wizard(self, q_im_raw):
+		if q_im_raw is not None:
+			c_raw = qimage_to_bgr_np(q_im_raw)
 
-		# Convert QImage -> BGR ndarray
-		bgr = qimage_to_bgr_np(qimg)
+			if (self.worker.draw_plane or self.worker.draw_roi) and getattr(self.worker, "color_intrinsics", None) is not None and self.plane is not None:
+				c_raw = overlay_plane_and_roi_on_bgr(c_raw, self.worker.color_intrinsics, self.plane.p0, self.plane.u, self.plane.v, self.plane.n, 
+											self.pl_size_x, self.pl_size_z, self.roi_y_min, self.roi_y_max, self.roi_x_extend, self.roi_z_extend, 
+											self.roi_mirror_x, self.roi_mirror_z, self.worker.draw_plane, self.worker.draw_roi)
+			c_bgr = _apply_rotation(self.worker.rot_k, c_raw)
 
-		show = bgr
-		if (self.cam_show_plane or self.cam_show_roi) and getattr(self.worker, "color_intrinsics", None) is not None and self.plane is not None:
-			show = overlay_plane_and_roi_on_bgr( show, self.worker.color_intrinsics, self.plane.p0, self.plane.u, self.plane.v, self.plane.n, 
-									   self.pl_size_x, self.pl_size_z, self.roi_y_min, self.roi_y_max, self.roi_x_extend, self.roi_z_extend, 
-									   self.roi_mirror_x, self.roi_mirror_z, self.cam_show_plane, self.cam_show_roi)
-
-		# Convert back to QImage for AspectImageView
-		self.camLabel.setImage(bgr_np_to_qimage(show))
+			# Convert back to QImage for AspectImageView
+			self.camLabel.setImage(bgr_np_to_qimage(c_bgr))
 #=================================================================
 
